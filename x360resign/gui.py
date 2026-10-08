@@ -191,10 +191,12 @@ class App:
         if not os.path.isdir(self.get("input")):
             messagebox.showerror("Missing", "Pick the mod files folder first.")
             return
-        self.run_in_thread(self._check_files_worker)
+        folder = self.get("input")
+        self.run_in_thread(lambda: self._check_files_worker(folder))
 
-    def _check_files_worker(self):
-        items, skipped = collect_inputs([self.get("input")])
+    def _check_files_worker(self, folder):
+        # Runs on a worker thread: only touch the queue, never Tk widgets/variables.
+        items, skipped = collect_inputs([folder])
         for message in skipped:
             self.log("note: " + message)
         for item in items:
@@ -240,11 +242,13 @@ class App:
             save_config({name: self.get(name) for name in self.vars})
         except OSError:
             pass
-        self.run_in_thread(lambda: self._resign_worker(options))
+        folder, output = self.get("input"), self.get("output")
+        self.run_in_thread(lambda: self._resign_worker(options, folder, output))
 
-    def _resign_worker(self, options):
+    def _resign_worker(self, options, folder, output):
+        # Runs on a worker thread: only touch the queue, never Tk widgets/variables.
         self.log("=" * 70)
-        summary = run_batch([self.get("input")], self.get("output"), options, log=self.log)
+        summary = run_batch([folder], output, options, log=self.log)
         self.log("")
         self.log("DONE: %d resigned, %d rehashed (not signed), %d copied, %d skipped, %d failed"
                  % (summary.count("RESIGNED"), summary.count("REHASHED, NOT SIGNED"),
