@@ -1,2 +1,6 @@
 *.bat text eol=crlf
 *.py text eol=lf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.cpp text eol=crlf
+*.xml text eol=crlf

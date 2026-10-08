@@ -247,3 +247,12 @@ Set `X360RESIGN_SLOW=0` to skip the 120 MB test.
 The format work follows the public documentation and open-source tools of the
 Xbox 360 scene: the Free60 STFS notes, Velocity / XboxInternals (hetelek) and
 stfschk (emoose).
+
+---
+
+## Extra: music from the hard drive while you play
+
+[`homebrew/HddMusic`](homebrew/HddMusic/README.md) is a DashLaunch plugin
+(Visual Studio 2010 + XDK) for RGH/JTAG consoles. It copies music from a USB
+stick to the hard drive and plays it in the background during games, so the
+stick doesn't need to stay plugged in.

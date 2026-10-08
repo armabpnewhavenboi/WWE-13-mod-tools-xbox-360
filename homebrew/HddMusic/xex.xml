@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!-- Image settings for HddMusic.xex. sysdll makes it load as a system DLL,
+     which is what DashLaunch plugins need. Change baseaddr if it clashes
+     with another plugin you run. -->
+<xex>
+  <baseaddr addr="0x91C40000"/>
+  <sysdll/>
+  <format>
+    <compressed/>
+  </format>
+</xex>
