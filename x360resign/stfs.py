@@ -1,4 +1,4 @@
-"""Xbox 360 STFS package (CON / LIVE / PIRS) reader, rehasher and resigner.
+"""Xbox 360 STFS package (CON / LIVE / PIRS) reader and rehasher.
 
 Layout reference: Free60 STFS notes, Velocity (XboxInternals/Stfs) and
 emoose's stfschk.  Everything is done on an in-memory copy of the package;
@@ -7,8 +7,7 @@ call ``to_bytes()`` / ``save()`` to get the result.
 Header map (offsets from the start of the file):
 
     0x000  magic "CON " / "LIVE" / "PIRS"
-    0x004  CON: console certificate (0x1A8)   LIVE/PIRS: RSA-2048 signature (0x100)
-    0x1AC  CON: package signature (0x80, PKCS#1 SHA-1 over 0x22C..0x344)
+    0x004  signature block (left untouched by this tool)
     0x22C  license entries (16 x 0x10)
     0x32C  header SHA-1 (covers 0x344 .. end of header block)
     0x340  header size
@@ -18,13 +17,13 @@ Header map (offsets from the start of the file):
     0x3FD  device ID (0x14)      0x411 display names (UTF-16BE)
 """
 
+import hashlib
 import os
 import re
 import struct
 
-from .xecrypt import bnqw_to_int, sha1, xbox_pkcs1_verify
-
 BLOCK_SIZE = 0x1000
+OFF_CREATOR_CONSOLE_ID = 0x006
 HASH_ENTRY_SIZE = 0x18
 ENTRIES_PER_TABLE = 0xAA
 BLOCKS_PER_LEVEL = (0xAA, 0x70E4, 0x4AF768)  # data blocks covered by one table at level 0/1/2
@@ -35,14 +34,6 @@ MAGIC_LIVE = b"LIVE"
 MAGIC_PIRS = b"PIRS"
 MAGICS = (MAGIC_CON, MAGIC_LIVE, MAGIC_PIRS)
 
-OFF_CERTIFICATE = 0x004
-CERTIFICATE_SIZE = 0x1A8
-OFF_CERT_CONSOLE_ID = 0x006
-OFF_CERT_EXPONENT = 0x028
-OFF_CERT_MODULUS = 0x02C
-OFF_SIGNATURE = 0x1AC
-SIGNATURE_SIZE = 0x80
-OFF_LICENSES = 0x22C
 OFF_HEADER_HASH = 0x32C
 OFF_HEADER_SIZE = 0x340
 OFF_HASHED_HEADER = 0x344
@@ -118,6 +109,10 @@ class StfsError(Exception):
     pass
 
 
+def sha1(data):
+    return hashlib.sha1(data).digest()
+
+
 def _be24(b):
     return (b[0] << 16) | (b[1] << 8) | b[2]
 
@@ -185,8 +180,6 @@ class VerifyReport:
         self.root_hash_ok = None
         self.bad_tables = []      # (level, index)
         self.bad_blocks = []      # data block numbers whose hash does not match
-        self.signature_ok = None  # True / False / None (not checkable)
-        self.signature_note = ""
         self.problems = []
 
     @property
@@ -196,7 +189,7 @@ class VerifyReport:
 
     @property
     def ok(self):
-        return self.hashes_ok and self.signature_ok is not False and not self.problems
+        return self.hashes_ok and not self.problems
 
     def summary(self):
         parts = []
@@ -208,12 +201,6 @@ class VerifyReport:
                 text += " (%d bad block hash%s)" % (len(self.bad_blocks),
                                                     "" if len(self.bad_blocks) == 1 else "es")
             parts.append(text)
-        if self.signature_ok is True:
-            parts.append("signature OK")
-        elif self.signature_ok is False:
-            parts.append("signature BAD")
-        elif self.signature_note:
-            parts.append(self.signature_note)
         return ", ".join(parts)
 
 
@@ -331,10 +318,11 @@ class StfsPackage:
         self._put(OFF_DEVICE_ID, value, 0x14)
 
     @property
-    def certificate_console_id(self):
+    def creator_console_id(self):
+        """Console ID of the console that wrote this package (CON only, header block 0x006)."""
         if not self.is_con:
             return b""
-        return bytes(self.data[OFF_CERT_CONSOLE_ID:OFF_CERT_CONSOLE_ID + 5])
+        return bytes(self.data[OFF_CREATOR_CONSOLE_ID:OFF_CREATOR_CONSOLE_ID + 5])
 
     @property
     def display_name(self):
@@ -601,41 +589,9 @@ class StfsPackage:
         self.fix_header_hash()
         return changed
 
-    # ------------------------------------------------------------- signing
-
-    def install_certificate(self, certificate):
-        if not self.is_con:
-            raise StfsError("only CON packages carry a console certificate")
-        self._put(OFF_CERTIFICATE, certificate, CERTIFICATE_SIZE)
-
-    def signed_region(self):
-        return bytes(self.data[OFF_LICENSES:OFF_HASHED_HEADER])
-
-    def sign(self, keyvault):
-        """Install the KV's certificate, fix the header hash and sign (CON only)."""
-        if not self.is_con:
-            raise StfsError("%s packages are signed by Microsoft and cannot be resigned"
-                            % self.magic.decode().strip())
-        self.install_certificate(keyvault.certificate)
-        self.fix_header_hash()
-        self.data[OFF_SIGNATURE:OFF_SIGNATURE + SIGNATURE_SIZE] = keyvault.sign(self.signed_region())
-
-    def verify_signature(self):
-        """True/False for CON packages, None for LIVE/PIRS (Microsoft keys)."""
-        if not self.is_con:
-            return None
-        exponent = self._u32(OFF_CERT_EXPONENT)
-        raw_mod = bytes(self.data[OFF_CERT_MODULUS:OFF_CERT_MODULUS + 0x80])
-        sig = bytes(self.data[OFF_SIGNATURE:OFF_SIGNATURE + SIGNATURE_SIZE])
-        message = self.signed_region()
-        for modulus in (bnqw_to_int(raw_mod), int.from_bytes(raw_mod, "big")):
-            if modulus and xbox_pkcs1_verify(modulus, exponent, message, sig):
-                return True
-        return False
-
     # ------------------------------------------------------------ verification
 
-    def verify(self, check_signature=True):
+    def verify(self):
         report = VerifyReport()
         report.header_hash_ok = (self.compute_header_hash()
                                  == bytes(self.data[OFF_HEADER_HASH:OFF_HEADER_HASH + 0x14]))
@@ -658,10 +614,6 @@ class StfsPackage:
                                 report.bad_tables.append((level - 1, index * ENTRIES_PER_TABLE + entry))
             root = sha1(self._read(self.table_offset(self.top_level, 0), BLOCK_SIZE))
             report.root_hash_ok = root == bytes(self.data[OFF_VD_ROOT_HASH:OFF_VD_ROOT_HASH + 0x14])
-        if check_signature:
-            report.signature_ok = self.verify_signature()
-            if report.signature_ok is None:
-                report.signature_note = "Microsoft-signed %s (not checked)" % self.magic.decode().strip()
         return report
 
     # ----------------------------------------------------------- embedded ids
@@ -702,8 +654,6 @@ class StfsPackage:
             "Console ID      : %s" % self.console_id.hex().upper(),
             "Device ID       : %s" % self.device_id.hex().upper(),
         ]
-        if self.is_con:
-            lines.append("Signed by       : console %s" % self.certificate_console_id.hex().upper())
         if self.is_stfs:
             lines.append("Blocks          : %d allocated, %d free, %s format, hash levels: %d"
                          % (self.total_blocks, self.free_blocks,

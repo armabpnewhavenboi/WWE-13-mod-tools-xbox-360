@@ -7,8 +7,8 @@ import sys
 from . import __version__
 from .config import default_config_path, load_config, save_config
 from .ids import IdError, fmt, parse_console_id, parse_device_id, parse_profile_id
-from .keyvault import KeyVaultError, load_keyvault_file, parse_cpu_key
-from .resigner import Options, collect_inputs, ids_from_package, run_batch
+from .resigner import (STATUS_COPIED, STATUS_RESIGNED, STATUS_SKIPPED, Options, collect_inputs,
+                        ids_from_package, run_batch)
 from .stfs import StfsError, StfsPackage, decode_ms_time
 
 
@@ -21,32 +21,30 @@ def _ids_argument_group(parser):
     group.add_argument("--profile-id", metavar="HEX16",
                        help="your profile ID, 16 hex characters (e.g. E00001234ABCD567)")
     group.add_argument("--console-id", metavar="HEX10",
-                       help="console ID, 10 hex characters (default: taken from the KV)")
+                       help="console ID, 10 hex characters (optional; default: keep each "
+                            "save's own)")
     group.add_argument("--device-id", metavar="HEX40",
                        help="device ID of your USB stick / hard drive, 40 hex characters (optional)")
     group.add_argument("--ids-from", metavar="SAVE",
                        help="read profile/console/device IDs from one of YOUR OWN saves")
-    keys = parser.add_argument_group("signing")
-    keys.add_argument("--kv", metavar="KV.bin", help="your console's KeyVault (needed to sign)")
-    keys.add_argument("--cpu-key", metavar="HEX32",
-                      help="CPU key, only needed if the KV is still encrypted (raw NAND KV)")
-    keys.add_argument("--no-sign", action="store_true",
-                      help="no KV: fix IDs and hashes only (retail consoles will still reject it)")
+    # Accepted and ignored so command lines from older versions keep working.
+    parser.add_argument("--no-sign", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", metavar="INI",
                         help="settings file to read (default: %s)" % os.path.basename(default_config_path()))
     parser.add_argument("--save-config", action="store_true",
-                        help="remember the IDs / KV path given on this command line")
+                        help="remember the IDs given on this command line")
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="x360resign",
-        description="Batch rehash + resign Xbox 360 saves (CON packages) to your own profile "
-                    "and console. Run with no arguments to open the window version.")
+        description="Batch resign Xbox 360 saves (CON packages) to your own profile: swaps in "
+                    "your IDs and rehashes. Run with no arguments to open the window version.")
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    resign = sub.add_parser("resign", help="rehash + resign every save found in folders / zips")
+    resign = sub.add_parser("resign", help="put your IDs in every save found in folders / zips "
+                                           "and rehash them")
     resign.add_argument("inputs", nargs="+", help="files, folders or .zip files with the mod saves")
     resign.add_argument("-o", "--output", required=True,
                         help="output folder (originals are never modified)")
@@ -63,16 +61,12 @@ def build_parser():
     info.add_argument("files", nargs="+")
     info.add_argument("--files-list", action="store_true", help="also list the files inside")
 
-    verify = sub.add_parser("verify", help="check hashes and signatures of packages")
+    verify = sub.add_parser("verify", help="check the hashes of packages (are they intact?)")
     verify.add_argument("inputs", nargs="+")
 
     extract = sub.add_parser("extract", help="extract the files stored inside a package")
     extract.add_argument("file")
     extract.add_argument("-o", "--output", required=True)
-
-    kvinfo = sub.add_parser("kvinfo", help="check a KeyVault file and show its console ID")
-    kvinfo.add_argument("kv")
-    kvinfo.add_argument("--cpu-key", metavar="HEX32")
 
     ids = sub.add_parser("ids", help="print the profile / console / device IDs stored in a save")
     ids.add_argument("files", nargs="+")
@@ -91,40 +85,23 @@ def resolve_settings(args):
     def given(name):
         return getattr(args, name, None)
 
-    for name in ("profile_id", "console_id", "device_id", "kv", "cpu_key"):
+    for name in ("profile_id", "console_id", "device_id"):
         if given(name):
             settings[name] = given(name)
 
-    explicit_console = bool(given("console_id"))
     if args.ids_from:
         p, c, d = ids_from_package(args.ids_from)
-        if not given("profile_id"):
-            settings["profile_id"] = p.hex()
-        if not explicit_console:
-            settings["console_id_from_save"] = c.hex()
-        if not given("device_id"):
-            settings["device_id"] = d.hex()
-
-    kv = None
-    if settings.get("kv") and not args.no_sign:
-        cpu = parse_cpu_key(settings["cpu_key"]) if settings.get("cpu_key") else None
-        kv = load_keyvault_file(settings["kv"], cpu_key=cpu)
-    elif not args.no_sign:
-        raise UsageError("No KeyVault given. Use --kv KV.bin to sign the saves, or --no-sign to "
-                         "only change the IDs and rehash (they will NOT load on a retail console "
-                         "until they are signed).")
+        for name, value in (("profile_id", p), ("console_id", c), ("device_id", d)):
+            if value is not None and not given(name):
+                settings[name] = value.hex()
 
     profile = parse_profile_id(settings["profile_id"]) if settings.get("profile_id") else None
     if profile is None:
         raise UsageError("No profile ID given. Use --profile-id or --ids-from.")
-    console = None
-    if settings.get("console_id"):
-        console = parse_console_id(settings["console_id"])
-    elif kv is None and settings.get("console_id_from_save"):
-        console = parse_console_id(settings["console_id_from_save"])
+    console = parse_console_id(settings["console_id"]) if settings.get("console_id") else None
     device = parse_device_id(settings["device_id"]) if settings.get("device_id") else None
 
-    options = Options(profile_id=profile, console_id=console, device_id=device, keyvault=kv,
+    options = Options(profile_id=profile, console_id=console, device_id=device,
                       patch_embedded=getattr(args, "patch_embedded_ids", False),
                       include_profiles=getattr(args, "include_profiles", False),
                       layout=getattr(args, "layout", "usb"))
@@ -135,29 +112,21 @@ def cmd_resign(args):
     options, settings = resolve_settings(args)
     if args.save_config:
         path = save_config({k: settings.get(k, "") for k in
-                            ("profile_id", "console_id", "device_id", "kv", "cpu_key")}, args.config)
+                            ("profile_id", "console_id", "device_id")}, args.config)
         print("Settings saved to %s" % path)
     print("Profile ID : %s" % fmt(options.profile_id))
-    if options.keyvault:
-        print("Signing KV : console %s (%s)" % (fmt(options.keyvault.console_id),
-                                                options.keyvault.console_type))
-        if not options.keyvault.cert_matches_key:
-            print("WARNING: this KV's certificate does not match its private key")
-    else:
-        print("Signing KV : none (--no-sign)")
-    print("Console ID : %s" % fmt(options.console_id or
-                                  (options.keyvault.console_id if options.keyvault else None)))
+    print("Console ID : %s" % (fmt(options.console_id) if options.console_id else "(unchanged)"))
     print("Device ID  : %s" % (fmt(options.device_id) if options.device_id else "(unchanged)"))
     print()
     summary = run_batch(args.inputs, args.output, options)
     print()
-    print("Done: %d resigned, %d rehashed (unsigned), %d copied, %d skipped, %d failed"
-          % (summary.count("RESIGNED"), summary.count("REHASHED, NOT SIGNED"),
-             summary.count("COPIED UNCHANGED"), summary.count("SKIPPED"), summary.failed))
+    print("Done: %d resigned, %d copied, %d skipped, %d failed"
+          % (summary.count(STATUS_RESIGNED), summary.count(STATUS_COPIED),
+             summary.count(STATUS_SKIPPED), summary.failed))
     if summary.report_path:
         print("Report     : %s" % summary.report_path)
         print("Output     : %s" % os.path.abspath(args.output))
-    return 1 if summary.failed else 0
+    return 1 if summary.failed or not summary.results else 0
 
 
 def cmd_info(args):
@@ -215,14 +184,6 @@ def cmd_extract(args):
     return 0
 
 
-def cmd_kvinfo(args):
-    cpu = parse_cpu_key(args.cpu_key) if args.cpu_key else None
-    kv = load_keyvault_file(args.kv, cpu_key=cpu)
-    print(kv.describe())
-    print("KV is usable for signing.")
-    return 0
-
-
 def cmd_ids(args):
     for path in args.files:
         profile, console, device = ids_from_package(path)
@@ -249,7 +210,7 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     handlers = {"resign": cmd_resign, "info": cmd_info, "verify": cmd_verify,
-                "extract": cmd_extract, "kvinfo": cmd_kvinfo, "ids": cmd_ids}
+                "extract": cmd_extract, "ids": cmd_ids}
     if args.command == "gui":
         return launch_gui()
     if args.command not in handlers:
@@ -257,6 +218,6 @@ def main(argv=None):
         return 1
     try:
         return handlers[args.command](args)
-    except (UsageError, IdError, KeyVaultError, StfsError, OSError) as exc:
+    except (UsageError, IdError, StfsError, OSError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
         return 2

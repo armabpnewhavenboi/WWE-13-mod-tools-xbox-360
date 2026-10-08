@@ -12,17 +12,17 @@ from tkinter.scrolledtext import ScrolledText
 from . import __version__
 from .config import load_config, save_config
 from .ids import IdError, fmt, parse_console_id, parse_device_id, parse_profile_id
-from .keyvault import KeyVaultError, load_keyvault_file, parse_cpu_key
-from .resigner import Options, collect_inputs, ids_from_package, run_batch
+from .resigner import (STATUS_COPIED, STATUS_RESIGNED, STATUS_SKIPPED, Options, collect_inputs,
+                        ids_from_package, run_batch)
 from .stfs import StfsError, StfsPackage
 
 HELP_TEXT = (
     "1) Mod files folder: the folder with the save files you kept (zips inside are read too).\n"
     "2) Profile ID: yours. Easiest: copy any one of your own saves to a FAT32 USB stick on the\n"
     "   Xbox, then use 'Read IDs from one of my saves' and pick that file.\n"
-    "3) KV.bin: your console's KeyVault (dumped from an RGH/JTAG console). Without it the saves\n"
-    "   get your IDs and fresh hashes but are NOT signed, so a retail console rejects them.\n"
-    "4) Press RESIGN ALL. Copy the 'Content' folder from the output to the root of the USB stick.\n"
+    "3) Press RESIGN ALL. Copy the 'Content' folder from the output to the root of the USB stick.\n"
+    "4) Saves made with DLC also need that DLC on the stick or console (the log lists any DLC\n"
+    "   found in the mod folder).\n"
 )
 
 
@@ -36,8 +36,7 @@ class App:
 
         cfg = load_config()
         self.vars = {name: tk.StringVar(value=cfg.get(name, "")) for name in
-                     ("input", "output", "profile_id", "console_id", "device_id", "kv", "cpu_key")}
-        self.sign_var = tk.BooleanVar(value=True)
+                     ("input", "output", "profile_id", "console_id", "device_id")}
         self.patch_var = tk.BooleanVar(value=False)
         self.flat_var = tk.BooleanVar(value=False)
 
@@ -76,29 +75,15 @@ class App:
         row += 1
         label("Console ID (10 hex)", row)
         entry("console_id", row)
-        ttk.Label(frame, text="blank = use KV's").grid(row=row, column=2, sticky="w")
+        ttk.Label(frame, text="optional").grid(row=row, column=2, sticky="w")
         row += 1
         label("Device ID (40 hex)", row)
         entry("device_id", row)
         ttk.Label(frame, text="optional").grid(row=row, column=2, sticky="w")
         row += 1
 
-        ttk.Separator(frame).grid(row=row, column=0, columnspan=3, sticky="we", pady=6)
-        row += 1
-        ttk.Label(frame, text="Signing", font=("TkDefaultFont", 10, "bold")).grid(row=row, column=0, sticky="w")
-        row += 1
-        label("KeyVault (KV.bin)", row)
-        entry("kv", row)
-        ttk.Button(frame, text="Browse...", command=self.pick_kv).grid(row=row, column=2, padx=4)
-        row += 1
-        label("CPU key (encrypted KV only)", row)
-        entry("cpu_key", row)
-        ttk.Button(frame, text="Check KV", command=self.check_kv).grid(row=row, column=2, padx=4)
-        row += 1
-
         opts = ttk.Frame(frame)
         opts.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
-        ttk.Checkbutton(opts, text="Sign with KV", variable=self.sign_var).pack(side="left", padx=4)
         ttk.Checkbutton(opts, text="Also patch old IDs inside the save data",
                         variable=self.patch_var).pack(side="left", padx=4)
         ttk.Checkbutton(opts, text="Flat output (no Content folders)",
@@ -150,12 +135,6 @@ class App:
         if path:
             self.vars["output"].set(path)
 
-    def pick_kv(self):
-        path = filedialog.askopenfilename(title="Your KV.bin",
-                                          filetypes=[("KeyVault", "*.bin"), ("All files", "*.*")])
-        if path:
-            self.vars["kv"].set(path)
-
     def read_ids(self):
         path = filedialog.askopenfilename(title="Pick one of YOUR OWN saves (any game)")
         if not path:
@@ -165,27 +144,16 @@ class App:
         except (StfsError, OSError) as exc:
             messagebox.showerror("Not a save", "Could not read that file:\n%s" % exc)
             return
+        if profile is None:
+            messagebox.showerror("Not your save",
+                                 "That file isn't tied to a profile (it's shared content).\n"
+                                 "Pick a save from your own Content\\<profile ID> folder.")
+            return
         self.vars["profile_id"].set(fmt(profile))
-        self.vars["device_id"].set(fmt(device))
-        if not self.get("kv"):
-            self.vars["console_id"].set(fmt(console))
+        self.vars["console_id"].set(fmt(console) if console else "")
+        self.vars["device_id"].set(fmt(device) if device else "")
         self.log("Read IDs from %s:\n  profile %s\n  console %s\n  device  %s"
                  % (path, fmt(profile), fmt(console), fmt(device)))
-
-    def load_kv(self):
-        cpu = parse_cpu_key(self.get("cpu_key")) if self.get("cpu_key") else None
-        return load_keyvault_file(self.get("kv"), cpu_key=cpu)
-
-    def check_kv(self):
-        if not self.get("kv"):
-            messagebox.showinfo("KV", "Pick your KV.bin first.")
-            return
-        try:
-            kv = self.load_kv()
-        except (KeyVaultError, OSError) as exc:
-            messagebox.showerror("KV problem", str(exc))
-            return
-        self.log("KeyVault OK:\n" + kv.describe())
 
     def check_files(self):
         if not os.path.isdir(self.get("input")):
@@ -214,20 +182,12 @@ class App:
             raise IdError("Pick the mod files folder first.")
         if not self.get("output"):
             raise IdError("Pick an output folder.")
-        kv = None
-        if self.sign_var.get():
-            if not self.get("kv"):
-                raise IdError("'Sign with KV' is ticked but no KV.bin is selected.\n\nPick your "
-                              "KV.bin, or untick 'Sign with KV' to only fix IDs and hashes "
-                              "(retail consoles will reject unsigned saves).")
-            kv = self.load_kv()
         if not self.get("profile_id"):
             raise IdError("Enter your Profile ID (or use 'Read IDs from one of my saves').")
         return Options(
             profile_id=parse_profile_id(self.get("profile_id")),
             console_id=parse_console_id(self.get("console_id")) if self.get("console_id") else None,
             device_id=parse_device_id(self.get("device_id")) if self.get("device_id") else None,
-            keyvault=kv,
             patch_embedded=self.patch_var.get(),
             layout="flat" if self.flat_var.get() else "usb",
         )
@@ -235,7 +195,7 @@ class App:
     def start(self):
         try:
             options = self.build_options()
-        except (IdError, KeyVaultError, OSError) as exc:
+        except (IdError, OSError) as exc:
             messagebox.showerror("Can't start yet", str(exc))
             return
         try:
@@ -250,13 +210,14 @@ class App:
         self.log("=" * 70)
         summary = run_batch([folder], output, options, log=self.log)
         self.log("")
-        self.log("DONE: %d resigned, %d rehashed (not signed), %d copied, %d skipped, %d failed"
-                 % (summary.count("RESIGNED"), summary.count("REHASHED, NOT SIGNED"),
-                    summary.count("COPIED UNCHANGED"), summary.count("SKIPPED"), summary.failed))
+        self.log("DONE: %d resigned, %d copied, %d skipped, %d failed"
+                 % (summary.count(STATUS_RESIGNED), summary.count(STATUS_COPIED),
+                    summary.count(STATUS_SKIPPED), summary.failed))
         if summary.report_path:
             self.log("Report: %s" % summary.report_path)
-            self.log("Copy the 'Content' folder inside the output folder to the root of your "
-                     "FAT32 USB stick.")
+            if options.layout == "usb":
+                self.log("Copy the 'Content' folder inside the output folder to the root of your "
+                         "FAT32 USB stick.")
 
     def run_in_thread(self, func):
         if self.worker and self.worker.is_alive():

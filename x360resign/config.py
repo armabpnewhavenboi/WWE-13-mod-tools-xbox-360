@@ -5,7 +5,7 @@ import os
 import sys
 
 CONFIG_NAME = "x360resign.ini"
-KEYS = ("profile_id", "console_id", "device_id", "kv", "cpu_key", "input", "output")
+KEYS = ("profile_id", "console_id", "device_id", "input", "output")
 
 
 def default_config_path():

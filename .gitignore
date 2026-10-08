@@ -5,8 +5,10 @@ dist/
 *.spec
 *.egg-info/
 
-# Your personal settings and console keys - never commit these.
+# Your personal settings (profile ID etc.)
 x360resign.ini
+
+# Console key dumps from older versions of this tool - never commit these.
 *.bin
 KV*
 kv*

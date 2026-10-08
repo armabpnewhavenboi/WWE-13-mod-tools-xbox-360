@@ -1,4 +1,4 @@
-"""Test helpers: build synthetic STFS packages and KeyVaults from scratch.
+"""Test helper: build synthetic STFS packages from scratch.
 
 The physical block layout here is produced by walking the package
 sequentially (an independent formulation from the closed-form math in
@@ -9,7 +9,6 @@ import hashlib
 import random
 import struct
 
-from x360resign import xecrypt
 
 BLOCK = 0x1000
 PER = (0xAA, 0x70E4, 0x4AF768)
@@ -17,86 +16,6 @@ PER = (0xAA, 0x70E4, 0x4AF768)
 
 def sha1(data):
     return hashlib.sha1(data).digest()
-
-
-# ------------------------------------------------------------------ RSA / KV
-
-def _is_probable_prime(n, rng):
-    if n < 2:
-        return False
-    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
-        if n % p == 0:
-            return n == p
-    d, s = n - 1, 0
-    while d % 2 == 0:
-        d //= 2
-        s += 1
-    for _ in range(32):
-        a = rng.randrange(2, n - 2)
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(s - 1):
-            x = pow(x, 2, n)
-            if x == n - 1:
-                break
-        else:
-            return False
-    return True
-
-
-def _random_prime(bits, rng, e=0x10001):
-    while True:
-        candidate = rng.getrandbits(bits) | (1 << (bits - 1)) | (1 << (bits - 2)) | 1
-        if candidate % e != 1 and _is_probable_prime(candidate, rng):
-            return candidate
-
-
-def make_rsa_1024(seed):
-    rng = random.Random(seed)
-    e = 0x10001
-    while True:
-        p = _random_prime(512, rng)
-        q = _random_prime(512, rng)
-        if p != q and (p * q).bit_length() == 1024:
-            return p * q, e, p, q
-
-
-def make_keyvault(seed=1, console_id=bytes.fromhex("0123456789"), header=True,
-                  serial=b"123456789012", mismatched_cert=False):
-    n, e, p, q = make_rsa_1024(seed)
-    d = pow(e, -1, (p - 1) * (q - 1))
-    kv = bytearray(0x4000)
-    rng = random.Random(seed + 1000)
-    kv[0:0x18] = bytes(rng.getrandbits(8) for _ in range(0x18))
-    kv[0xB0:0xBC] = serial
-    prv = bytearray()
-    prv += struct.pack(">IIQ", 0x10, e, 0)
-    prv += xecrypt.int_to_bnqw(n, 0x80)
-    prv += xecrypt.int_to_bnqw(p, 0x40)
-    prv += xecrypt.int_to_bnqw(q, 0x40)
-    prv += xecrypt.int_to_bnqw(d % (p - 1), 0x40)
-    prv += xecrypt.int_to_bnqw(d % (q - 1), 0x40)
-    prv += xecrypt.int_to_bnqw(pow(q, -1, p), 0x40)
-    assert len(prv) == 0x1D0
-    kv[0x298:0x298 + 0x1D0] = prv
-
-    cert = bytearray()
-    cert += struct.pack(">H", 0x1A8)
-    cert += console_id
-    cert += b"X803949-001"            # part number (0xB)
-    cert += b"\0\0\0\0"               # reserved
-    cert += struct.pack(">H", 0)      # privileges
-    cert += struct.pack(">I", 2)      # retail
-    cert += b"09-18-08"
-    cert += struct.pack(">I", e)
-    modulus = n if not mismatched_cert else make_rsa_1024(seed + 7)[0]
-    cert += xecrypt.int_to_bnqw(modulus, 0x80)
-    cert += bytes(rng.getrandbits(8) for _ in range(0x100))  # Microsoft's signature (opaque)
-    assert len(cert) == 0x1A8
-    kv[0x9C8:0x9C8 + 0x1A8] = cert
-    data = bytes(kv)
-    return data if header else data[0x10:]
 
 
 # ------------------------------------------------------------------ STFS
@@ -162,11 +81,11 @@ def build_package(files, *, magic=b"CON ", read_only=False, title_id=0x545107FC,
                   console_id=bytes.fromhex("FFEEDDCCBB"),
                   device_id=bytes(range(0x14)), content_type=1,
                   display_name="Test Save", title_name="WWE '13",
-                  extra_blocks=0, kv=None, seed=0, scatter=False, header_size=0x971A):
+                  extra_blocks=0, seed=0, scatter=False, header_size=0x971A):
     """files: list of (path, bytes).  Folders are created for 'a/b' style paths.
 
     ``scatter`` interleaves file blocks so chains are non-contiguous.
-    ``kv`` (KeyVault object) signs the package; otherwise signature is random.
+    The signature block (0x004..0x22C) is filled with random bytes.
     """
     rng = random.Random(seed)
 
@@ -275,13 +194,7 @@ def build_package(files, *, magic=b"CON ", read_only=False, title_id=0x545107FC,
 
     # ---- header ----
     out[0:4] = magic
-    if magic == b"CON ":
-        if kv is not None:
-            out[4:4 + 0x1A8] = kv.certificate
-        else:
-            out[4:4 + 0x1A8] = bytes(rng.getrandbits(8) for _ in range(0x1A8))
-    else:
-        out[4:4 + 0x100] = bytes(rng.getrandbits(8) for _ in range(0x100))
+    out[4:0x22C] = bytes(rng.getrandbits(8) for _ in range(0x22C - 4))  # signature block
     struct.pack_into(">QII", out, 0x22C, 0xFFFFFFFFFFFFFFFF, 0, 0)
     struct.pack_into(">III", out, 0x340, header_size, content_type, 2)
     struct.pack_into(">Q", out, 0x34C, len(out) - first_table)
@@ -306,9 +219,4 @@ def build_package(files, *, magic=b"CON ", read_only=False, title_id=0x545107FC,
     out[0x171A:0x171A + len(png)] = png
 
     out[0x32C:0x340] = sha1(bytes(out[0x344:first_table]))
-    if magic == b"CON ":
-        if kv is not None:
-            out[0x1AC:0x22C] = kv.sign(bytes(out[0x22C:0x344]))
-        else:
-            out[0x1AC:0x22C] = bytes(rng.getrandbits(8) for _ in range(0x80))
     return bytes(out)

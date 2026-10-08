@@ -1,5 +1,5 @@
-"""Batch pipeline: find every package in a pile of folders / zips, swap the IDs,
-rehash, resign and write a USB-ready ``Content`` tree plus a report."""
+"""Batch pipeline: find every package in a pile of folders / zips, swap in your IDs,
+rehash, and write a USB-ready ``Content`` tree plus a report."""
 
 import datetime
 import os
@@ -11,8 +11,7 @@ from .stfs import (CONTENT_TYPE_PROFILE, MAGIC_CON, StfsError, StfsPackage, is_s
 
 UNSUPPORTED_ARCHIVES = (".rar", ".7z", ".tar", ".gz", ".bz2", ".xz")
 
-STATUS_SIGNED = "RESIGNED"
-STATUS_UNSIGNED = "REHASHED, NOT SIGNED"
+STATUS_RESIGNED = "RESIGNED"
 STATUS_COPIED = "COPIED UNCHANGED"
 STATUS_SKIPPED = "SKIPPED"
 STATUS_FAILED = "FAILED"
@@ -21,12 +20,11 @@ REPORT_NAME = "resign_report.txt"
 
 
 class Options:
-    def __init__(self, profile_id=None, console_id=None, device_id=None, keyvault=None,
+    def __init__(self, profile_id=None, console_id=None, device_id=None,
                  patch_embedded=False, include_profiles=False, layout="usb"):
         self.profile_id = profile_id
         self.console_id = console_id
         self.device_id = device_id
-        self.keyvault = keyvault
         self.patch_embedded = patch_embedded
         self.include_profiles = include_profiles
         if layout not in ("usb", "flat"):
@@ -149,12 +147,16 @@ def collect_inputs(paths, exclude=None, log=print):
 
 
 def ids_from_package(path):
-    """Read (profile_id, console_id, device_id) from one of the user's own saves."""
+    """Read (profile_id, console_id, device_id) from one of the user's own saves.
+
+    An ID that is all zeros in that save means "not known" and is returned as None.
+    """
     pkg = StfsPackage.from_file(path)
     console = pkg.console_id
     if not any(console) and pkg.is_con:
-        console = pkg.certificate_console_id
-    return pkg.profile_id, console, pkg.device_id
+        console = pkg.creator_console_id
+    return tuple(value if any(value) else None
+                 for value in (pkg.profile_id, console, pkg.device_id))
 
 
 # ------------------------------------------------------------- processing
@@ -212,9 +214,8 @@ def process_package(data, filename, options, source=None):
 
     if pkg.magic != MAGIC_CON:
         result.status = STATUS_COPIED
-        result.notes.append("%s package (DLC / marketplace content) is signed by Microsoft. It is "
-                            "not tied to a profile, so it is copied unchanged."
-                            % pkg.magic.decode().strip())
+        result.notes.append("%s package (DLC / marketplace content). It is not tied to a "
+                            "profile, so it is copied unchanged." % pkg.magic.decode().strip())
         result.new_ids = result.old_ids
         return bytes(data), result
 
@@ -231,7 +232,6 @@ def process_package(data, filename, options, source=None):
         return None, result
 
     old_profile, old_console, old_device = result.old_ids
-    kv = options.keyvault
 
     if options.profile_id is None or not any(old_profile):
         new_profile = old_profile
@@ -239,12 +239,7 @@ def process_package(data, filename, options, source=None):
             result.notes.append("shared content (profile ID 0000000000000000) - profile ID left as-is")
     else:
         new_profile = options.profile_id
-    if options.console_id is not None:
-        new_console = options.console_id
-    elif kv is not None:
-        new_console = kv.console_id
-    else:
-        new_console = old_console
+    new_console = options.console_id if options.console_id is not None else old_console
     new_device = options.device_id if options.device_id is not None else old_device
 
     try:
@@ -270,17 +265,10 @@ def process_package(data, filename, options, source=None):
         result.new_ids = (new_profile, new_console, new_device)
 
         result.hashes_fixed = pkg.rehash()  # also refreshes the header hash
-        if kv is not None:
-            pkg.sign(kv)
-            result.status = STATUS_SIGNED
-        else:
-            result.status = STATUS_UNSIGNED
-            result.notes.append("no KeyVault given: hashes and IDs are fixed but the signature is "
-                                "still the old one, so a retail console will reject it until it "
-                                "is resigned")
+        result.status = STATUS_RESIGNED
 
-        result.after = pkg.verify(check_signature=kv is not None)
-        if not result.after.hashes_ok or (kv is not None and result.after.signature_ok is not True):
+        result.after = pkg.verify()
+        if not result.after.ok:
             result.status = STATUS_FAILED
             result.notes.append("self-check after resigning failed: %s" % result.after.summary())
             return None, result
@@ -317,7 +305,7 @@ class BatchSummary:
 
     @property
     def dlc(self):
-        """Microsoft-signed packages (DLC / marketplace content) found in the input."""
+        """LIVE / PIRS packages (DLC / marketplace content) found in the input."""
         return [r for r in self.results if r.kind in ("LIVE", "PIRS")]
 
     @property
@@ -340,12 +328,6 @@ def run_batch(paths, out_dir, options, log=print):
         warning = profile_id_warning(options.profile_id)
         if warning:
             log("WARNING: " + warning)
-    kv = options.keyvault
-    if kv is not None and options.console_id is not None and options.console_id != kv.console_id:
-        log("WARNING: console ID %s differs from the KV's console ID %s; the header will say %s "
-            "but the package is signed by %s."
-            % (fmt(options.console_id), fmt(kv.console_id), fmt(options.console_id),
-               fmt(kv.console_id)))
 
     log("Found %d package(s). Working..." % len(items))
     used = {}
@@ -380,13 +362,13 @@ def run_batch(paths, out_dir, options, log=print):
         for note in result.notes:
             log("        - " + note)
 
-    for line in dlc_notice(summary, out_dir):
+    for line in dlc_notice(summary, out_dir, options.layout):
         log(line)
     summary.report_path = write_report(summary, out_dir, options)
     return summary
 
 
-def dlc_notice(summary, out_dir):
+def dlc_notice(summary, out_dir, layout="usb"):
     """Lines explaining the DLC situation - the usual cause of WWE's "missing or damaged
     downloadable content" message after a save has been resigned successfully."""
     lines = [""]
@@ -396,10 +378,12 @@ def dlc_notice(summary, out_dir):
         for r in dlc:
             where = os.path.relpath(r.output, out_dir) if r.output else "(not written)"
             lines.append("  - %s  ->  %s" % (r.display_name or r.filename, where))
-        lines.append("Copy these to the USB stick too (they are in the Content\\0000000000000000 "
-                     "folder). DLC only works if it is licensed to your profile or console, i.e. "
-                     "bought on your account.")
-    if summary.count(STATUS_SIGNED) or summary.count(STATUS_UNSIGNED):
+        where = ("they are in the Content\\0000000000000000 folder" if layout == "usb"
+                 else "they are in the output folder")
+        lines.append("Copy these to the USB stick too (%s). If a save still says DLC is "
+                     "missing, it needs DLC that wasn't in this pack - install that DLC "
+                     "yourself." % where)
+    if summary.count(STATUS_RESIGNED):
         lines.append("If the game says a save can't be used because of \"missing or damaged "
                      "downloadable content\", the save itself loaded fine: it was made with DLC "
                      "(superstars, moves, arenas...) that is not installed on your console. "
@@ -410,21 +394,18 @@ def dlc_notice(summary, out_dir):
 def write_report(summary, out_dir, options):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, REPORT_NAME)
-    kv = options.keyvault
     lines = [
         "x360resign %s report - %s" % (__version__, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
         "",
         "Target profile ID : %s" % fmt(options.profile_id),
-        "Target console ID : %s" % fmt(options.console_id or (kv.console_id if kv else None)),
-        "Target device ID  : %s" % fmt(options.device_id) if options.device_id else
-        "Target device ID  : (unchanged)",
-        "Signed with KV    : %s" % (("console " + fmt(kv.console_id)) if kv else "NO (unsigned)"),
+        "Target console ID : %s" % (fmt(options.console_id) if options.console_id else "(unchanged)"),
+        "Target device ID  : %s" % (fmt(options.device_id) if options.device_id else "(unchanged)"),
         "Patch IDs in data : %s" % ("yes" if options.patch_embedded else "no (scan only)"),
         "",
     ]
-    for status in (STATUS_SIGNED, STATUS_UNSIGNED, STATUS_COPIED, STATUS_SKIPPED, STATUS_FAILED):
+    for status in (STATUS_RESIGNED, STATUS_COPIED, STATUS_SKIPPED, STATUS_FAILED):
         lines.append("%-22s %d" % (status + ":", summary.count(status)))
-    lines.extend(dlc_notice(summary, out_dir))
+    lines.extend(dlc_notice(summary, out_dir, options.layout))
     lines.append("")
     for result in summary.results:
         lines.append("=" * 78)

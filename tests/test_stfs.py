@@ -2,21 +2,11 @@ import os
 import random
 import unittest
 
-from x360resign.keyvault import load_keyvault
 from x360resign.stfs import BLOCK_SIZE, StfsError, StfsPackage
 
-from tests.builder import build_package, make_keyvault, simulate_layout
+from tests.builder import build_package, simulate_layout
 
 RUN_SLOW = os.environ.get("X360RESIGN_SLOW", "1") != "0"
-
-_KV = None
-
-
-def test_kv():
-    global _KV
-    if _KV is None:
-        _KV = load_keyvault(make_keyvault(seed=11))
-    return _KV
 
 
 def sample_files(rng, sizes):
@@ -50,7 +40,7 @@ class LayoutTests(unittest.TestCase):
 
 class PackageTests(unittest.TestCase):
     def check_roundtrip(self, files, **kw):
-        data = build_package(files, kv=test_kv(), **kw)
+        data = build_package(files, **kw)
         pkg = StfsPackage(data)
         report = pkg.verify()
         self.assertTrue(report.ok, report.summary())
@@ -82,7 +72,7 @@ class PackageTests(unittest.TestCase):
     def test_level2(self):
         rng = random.Random(3)
         files = sample_files(rng, [0x2000, 777])
-        data = build_package(files, kv=test_kv(), extra_blocks=0x70E4 + 0x150, seed=9)
+        data = build_package(files, extra_blocks=0x70E4 + 0x150, seed=9)
         pkg = StfsPackage(data)
         self.assertEqual(pkg.top_level, 2)
         self.assertTrue(pkg.verify().ok)
@@ -90,14 +80,12 @@ class PackageTests(unittest.TestCase):
         report = pkg.verify()
         self.assertEqual(report.bad_blocks, [0x70E4 + 0x100])
         self.assertGreater(pkg.rehash(), 0)
-        self.assertTrue(pkg.verify().hashes_ok)
-        pkg.sign(test_kv())
         self.assertTrue(pkg.verify().ok)
 
     def test_detects_and_repairs_damage(self):
         rng = random.Random(4)
         files = sample_files(rng, [0x1000 * 200, 4000])
-        data = build_package(files, kv=test_kv(), seed=5)
+        data = build_package(files, seed=5)
         pkg = StfsPackage(data)
         target = pkg.files()[0]
         pkg.write_file_bytes(target, 0x1000 * 180 + 3, b"MODDED")
@@ -106,17 +94,14 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(len(report.bad_blocks), 1)
         changed = pkg.rehash()
         self.assertGreaterEqual(changed, 3)  # block hash, L0 table hash, root
-        report = pkg.verify()
-        self.assertTrue(report.hashes_ok)
-        self.assertIs(report.signature_ok, False)  # header changed, old signature no longer fits
-        pkg.sign(test_kv())
         self.assertTrue(pkg.verify().ok)
+        self.assertEqual(pkg.data[:0x22C], data[:0x22C], "signature block must stay untouched")
         self.assertIn(b"MODDED", pkg.read_file(pkg.files()[0]))
 
     def test_inactive_hash_table_copies_are_left_alone(self):
         rng = random.Random(5)
         files = sample_files(rng, [0x1000 * 300])
-        data = build_package(files, kv=test_kv(), seed=6)
+        data = build_package(files, seed=6)
         pkg = StfsPackage(data)
         stale_before = [i for i in range(0, len(data), BLOCK_SIZE) if data[i:i + 16] == b"\xEE" * 16]
         pkg.write_file_bytes(pkg.files()[0], 0, b"\x01\x02")
@@ -146,12 +131,12 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(StfsError):
             StfsPackage(b"CON " + b"\0" * 10)
 
-    def test_live_package_cannot_be_signed(self):
+    def test_live_package_is_readable(self):
         data = build_package([("dlc.bin", b"dlc")], magic=b"LIVE", seed=8)
         pkg = StfsPackage(data)
-        self.assertIsNone(pkg.verify_signature())
-        with self.assertRaises(StfsError):
-            pkg.sign(test_kv())
+        self.assertFalse(pkg.is_con)
+        self.assertTrue(pkg.verify().ok)
+        self.assertEqual(pkg.read_file(pkg.files()[0]), b"dlc")
 
     def test_extract(self):
         import tempfile
@@ -164,11 +149,10 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(f.read(), b"B" * 10)
 
     def test_truncated_package_is_padded_on_rehash(self):
-        data = build_package([("a", b"z" * 0x3000)], seed=10, kv=test_kv())
+        data = build_package([("a", b"z" * 0x3000)], seed=10)
         pkg = StfsPackage(data[:-0x800])
         self.assertTrue(pkg.verify().problems)
         pkg.rehash()
-        pkg.sign(test_kv())
         self.assertEqual(len(pkg.data), len(data))
         self.assertTrue(pkg.verify().ok)
 
