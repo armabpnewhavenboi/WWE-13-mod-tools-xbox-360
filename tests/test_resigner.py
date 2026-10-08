@@ -119,6 +119,11 @@ class ResignerTests(unittest.TestCase):
             report = f.read()
         self.assertIn("RESIGNED", report)
         self.assertIn("old profile ID found inside owner.bin", report)
+        self.assertIn("DLC packages in this pack (1)", report)
+        self.assertIn(os.path.join("Content", "0000000000000000", TITLE, "00000002", "DLC_PACK"),
+                      report)
+        self.assertIn("missing or damaged downloadable content", report)
+        self.assertEqual([r.filename for r in summary.dlc], ["DLC_PACK"])
 
     def test_embedded_ids_reported_not_patched_by_default(self):
         summary = self.run_batch()

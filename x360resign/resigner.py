@@ -46,6 +46,7 @@ class Result:
         self.source = source
         self.filename = filename
         self.output_name = filename
+        self.kind = ""            # "CON", "LIVE" or "PIRS"
         self.status = STATUS_FAILED
         self.notes = []
         self.output = None
@@ -198,6 +199,7 @@ def process_package(data, filename, options, source=None):
     result.title_id = pkg.title_id
     result.content_type = pkg.content_type
     result.display_name = pkg.display_name
+    result.kind = pkg.magic.decode("ascii", "replace").strip()
     result.old_ids = (pkg.profile_id, pkg.console_id, pkg.device_id)
     # Some content is stored under its content ID (the header hash), which
     # changes when the header changes - such files must be renamed to match.
@@ -314,6 +316,11 @@ class BatchSummary:
         return sum(1 for r in self.results if r.status == status)
 
     @property
+    def dlc(self):
+        """Microsoft-signed packages (DLC / marketplace content) found in the input."""
+        return [r for r in self.results if r.kind in ("LIVE", "PIRS")]
+
+    @property
     def failed(self):
         return self.count(STATUS_FAILED)
 
@@ -373,8 +380,31 @@ def run_batch(paths, out_dir, options, log=print):
         for note in result.notes:
             log("        - " + note)
 
+    for line in dlc_notice(summary, out_dir):
+        log(line)
     summary.report_path = write_report(summary, out_dir, options)
     return summary
+
+
+def dlc_notice(summary, out_dir):
+    """Lines explaining the DLC situation - the usual cause of WWE's "missing or damaged
+    downloadable content" message after a save has been resigned successfully."""
+    lines = [""]
+    dlc = summary.dlc
+    if dlc:
+        lines.append("DLC packages in this pack (%d) - copied unchanged:" % len(dlc))
+        for r in dlc:
+            where = os.path.relpath(r.output, out_dir) if r.output else "(not written)"
+            lines.append("  - %s  ->  %s" % (r.display_name or r.filename, where))
+        lines.append("Copy these to the USB stick too (they are in the Content\\0000000000000000 "
+                     "folder). DLC only works if it is licensed to your profile or console, i.e. "
+                     "bought on your account.")
+    if summary.count(STATUS_SIGNED) or summary.count(STATUS_UNSIGNED):
+        lines.append("If the game says a save can't be used because of \"missing or damaged "
+                     "downloadable content\", the save itself loaded fine: it was made with DLC "
+                     "(superstars, moves, arenas...) that is not installed on your console. "
+                     "Install that DLC and the game's latest title update, then try again.")
+    return lines if len(lines) > 1 else []
 
 
 def write_report(summary, out_dir, options):
@@ -394,6 +424,7 @@ def write_report(summary, out_dir, options):
     ]
     for status in (STATUS_SIGNED, STATUS_UNSIGNED, STATUS_COPIED, STATUS_SKIPPED, STATUS_FAILED):
         lines.append("%-22s %d" % (status + ":", summary.count(status)))
+    lines.extend(dlc_notice(summary, out_dir))
     lines.append("")
     for result in summary.results:
         lines.append("=" * 78)
