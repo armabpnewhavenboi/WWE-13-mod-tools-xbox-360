@@ -138,10 +138,15 @@ class LibraryTests(unittest.TestCase):
             mindex.Library(b"x" * 600)
         broken = bytearray(data)
         struct.pack_into(">I", broken, 2 * 600 + 0x14, 999)  # track list points nowhere
-        broken_lib = mindex.Library(bytes(broken))
+        with self.assertRaises(mindex.MindexError):
+            mindex.Library(bytes(broken))
+        broken_lib = mindex.Library(bytes(broken), validate=False)
         self.assertTrue(broken_lib.check())
         with self.assertRaises(mindex.MindexError):
             broken_lib.add_song(song("Two", "Album", "Ann", "Pop", 2, 5000))
+        truncated = data[:len(data) - 600]  # the last record (the track) cut off
+        with self.assertRaises(mindex.MindexError):
+            mindex.Library(truncated)
 
     def test_record_limit(self):
         lib = mindex.Library()

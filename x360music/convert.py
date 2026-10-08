@@ -165,6 +165,8 @@ def make_song_file(song, out_path, ffmpeg, ffprobe, bitrate=192):
         wma_path = os.path.join(tmpdir, "song.wma")
         to_wma(song.path, wma_path, ffmpeg, bitrate)
         _, length_ms = probe(wma_path, ffprobe)
+        if not length_ms:
+            raise ConvertError("no audio in this file")
         with open(wma_path, "rb") as f:
             wma = f.read()
         header = fmim.build_header(song.title, song.album, song.artist, song.album_artist,

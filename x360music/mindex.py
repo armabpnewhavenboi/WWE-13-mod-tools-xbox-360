@@ -106,7 +106,7 @@ def media_name(index):
 
 
 class Library(object):
-    def __init__(self, data=None):
+    def __init__(self, data=None, validate=True):
         if data is None:
             self.records = self._fresh()
         else:
@@ -129,6 +129,27 @@ class Library(object):
         for kind in (TRACK, ALBUM, ARTIST, GENRE):
             if kind not in self.heads:
                 raise MindexError("mindex.xmi has no list of %ss" % TYPE_NAMES[kind])
+        if data is not None and validate:
+            self.validate()
+
+    def validate(self):
+        """Refuse a damaged library before anything is changed (Validate() in C++)."""
+        for kind in (TRACK, ALBUM, ARTIST, GENRE):
+            self.members(self.heads[kind], GLOBAL)
+        for index in range(len(self.records)):
+            kind = self.rtype(index)
+            if kind == ALBUM:
+                self.members(index, ALBUM_TRACKS)
+            elif kind == ARTIST:
+                self.members(index, ARTIST_TRACKS)
+                self.members(index, ARTIST_ALBUMS)
+            elif kind == GENRE:
+                self.members(index, GENRE_TRACKS)
+                self.members(index, GENRE_ALBUMS)
+            if kind in (TRACK, ALBUM):
+                links = (0x68, 0x74, 0x80) if kind == TRACK else (0x74, 0x80)
+                if any(self.u32(index, off) >= len(self.records) for off in links):
+                    raise MindexError("record %d points past the end of the library" % index)
 
     @staticmethod
     def _fresh():

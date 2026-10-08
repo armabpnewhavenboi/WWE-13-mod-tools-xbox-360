@@ -261,7 +261,40 @@ Result Library::Load(const unsigned char* data, unsigned int size)
     m_count = count;
     if (Type(0) != TYPE_HEADER || memcmp(m_data + 4, " IMX", 4) != 0)
         return RESULT_BAD_LIBRARY;
-    return FindHeads();
+    Result result = FindHeads();
+    return result == RESULT_OK ? Validate() : result;
+}
+
+// Checks every list we might change, and every link a track or album has, so
+// a damaged (e.g. cut short) library is refused before any file is touched.
+Result Library::Validate() const
+{
+    Result result;
+    for (unsigned int kind = TYPE_TRACK; kind <= TYPE_GENRE; kind++) {
+        if ((result = CheckList(m_heads[kind], GLOBAL)) != RESULT_OK)
+            return result;
+    }
+    for (unsigned int index = 0; index < m_count; index++) {
+        unsigned int type = Type(index);
+        if (type == TYPE_ALBUM) {
+            if ((result = CheckList(index, ALBUM_TRACKS)) != RESULT_OK)
+                return result;
+        } else if (type == TYPE_ARTIST) {
+            if ((result = CheckList(index, ARTIST_TRACKS)) != RESULT_OK ||
+                (result = CheckList(index, ARTIST_ALBUMS)) != RESULT_OK)
+                return result;
+        } else if (type == TYPE_GENRE) {
+            if ((result = CheckList(index, GENRE_TRACKS)) != RESULT_OK ||
+                (result = CheckList(index, GENRE_ALBUMS)) != RESULT_OK)
+                return result;
+        }
+        if (type == TYPE_TRACK || type == TYPE_ALBUM) {
+            if ((type == TYPE_TRACK && U32(index, 0x68) >= m_count) ||
+                U32(index, 0x74) >= m_count || U32(index, 0x80) >= m_count)
+                return RESULT_BAD_LIBRARY;
+        }
+    }
+    return RESULT_OK;
 }
 
 Result Library::FindHeads()

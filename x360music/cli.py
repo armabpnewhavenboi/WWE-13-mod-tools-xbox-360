@@ -93,6 +93,11 @@ def launch_gui():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    for stream in (sys.stdout, sys.stderr):  # song names may not fit the console's code page
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if not argv:
         return launch_gui()
     parser = build_parser()

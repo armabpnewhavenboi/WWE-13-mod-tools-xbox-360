@@ -74,6 +74,7 @@ private:
 
     bool Reserve(unsigned int records);
     Result FindHeads();
+    Result Validate() const;
     unsigned int Find(unsigned int type, const Name& name,
                       unsigned int offset1 = 0, unsigned int value1 = 0,
                       unsigned int offset2 = 0, unsigned int value2 = 0) const;

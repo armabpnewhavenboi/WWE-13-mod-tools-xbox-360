@@ -4,6 +4,7 @@ import concurrent.futures
 import glob
 import os
 import shutil
+import struct
 
 from . import asf, convert, fmim, mindex
 
@@ -38,7 +39,8 @@ def song_files(inputs):
     found = []
     for item in inputs:
         if os.path.isdir(item):
-            found.extend(sorted(glob.glob(os.path.join(item, "*" + convert.SONG_EXTENSION))))
+            found.extend(sorted(glob.glob(os.path.join(glob.escape(item),
+                                                       "*" + convert.SONG_EXTENSION))))
         elif os.path.isfile(item):
             found.append(item)
         else:
@@ -70,14 +72,15 @@ def write_song_list(folder):
         f.write("\n".join(lines) + "\n")
 
 
-def convert_all(inputs, usb, jobs=None, bitrate=192, force=False, log=print):
-    """Convert every music file in `inputs` to a song file in <usb>\\HddMusic."""
+def convert_all(inputs, usb, jobs=None, bitrate=192, force=False, log=print, cancel=None):
+    """Convert every music file in `inputs` to a song file in <usb>\\HddMusic.
+    Setting the `cancel` event (threading.Event) stops before the next song."""
     ffmpeg = convert.find_tool("ffmpeg")
     ffprobe = convert.find_tool("ffprobe")
     files = convert.find_music(inputs)
     summary = Summary(song_folder(usb))
     os.makedirs(summary.out_dir, exist_ok=True)
-    for stale in glob.glob(os.path.join(summary.out_dir, "*.part")):
+    for stale in glob.glob(os.path.join(glob.escape(summary.out_dir), "*.part")):
         os.remove(stale)
     if not files:
         log("No music files found.")
@@ -116,9 +119,13 @@ def convert_all(inputs, usb, jobs=None, bitrate=192, force=False, log=print):
 
     if todo:
         log("Converting %d song(s) to WMA %d kbps..." % (len(todo), bitrate))
+    def make(song, target):
+        if cancel is not None and cancel.is_set():
+            raise convert.ConvertError("cancelled")
+        return convert.make_song_file(song, target, ffmpeg, ffprobe, bitrate)
+
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
-        futures = {pool.submit(convert.make_song_file, song, target, ffmpeg, ffprobe, bitrate):
-                   song for song, target in todo}
+        futures = {pool.submit(make, song, target): song for song, target in todo}
         done = 0
         for future in concurrent.futures.as_completed(futures):
             song = futures[future]
@@ -200,7 +207,7 @@ def describe_song(data):
 def describe_wma(data):
     try:
         info = asf.describe(data)
-    except (asf.AsfError, ValueError) as exc:
+    except (asf.AsfError, ValueError, struct.error) as exc:
         return ["  audio: %s" % exc]
     keys = ("format_tag", "channels", "sample_rate", "bitrate", "block_align", "codec_data",
             "duration_ms", "preroll_ms", "packet_size", "packets", "flags", "file_size")
@@ -239,7 +246,7 @@ def _record_line(lib, index):
 
 
 def describe_library(data, records=False):
-    lib = mindex.Library(data)
+    lib = mindex.Library(data, validate=False)
     counts = ", ".join("%d %ss" % (lib.count(kind), mindex.TYPE_NAMES[kind])
                        for kind in (mindex.TRACK, mindex.ALBUM, mindex.ARTIST, mindex.GENRE,
                                     mindex.PLAYLIST, mindex.FREE))
@@ -256,7 +263,7 @@ def describe_library(data, records=False):
             for index, title, album, artist, number, length in lib.songs():
                 lines.append("  %s  %s - %s - %02d %s (%s)" % (
                     mindex.media_name(index), artist, album, number, title, _length(length)))
-        except mindex.MindexError as exc:
+        except (mindex.MindexError, IndexError) as exc:
             lines.append("  can't list the songs: %s" % exc)
     return lines
 

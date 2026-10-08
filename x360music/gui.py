@@ -28,6 +28,8 @@ class App:
         self.root = root
         self.queue = queue.Queue()
         self.worker = None
+        self.cancel = threading.Event()
+        root.protocol("WM_DELETE_WINDOW", self.close)
         root.title("x360music %s - songs for the Xbox 360 hard drive" % __version__)
         root.minsize(720, 480)
         self.music = tk.StringVar()
@@ -94,7 +96,7 @@ class App:
             # Runs on a worker thread: only touch the queue, never Tk widgets/variables.
             try:
                 self.log("=" * 70)
-                summary = convert_all([music], usb, log=self.log)
+                summary = convert_all([music], usb, log=self.log, cancel=self.cancel)
                 self.log("")
                 self.log("DONE: %d converted, %d already there, %d duplicates skipped, %d failed"
                          % (summary.converted, summary.existing, summary.duplicates,
@@ -106,6 +108,10 @@ class App:
                 self.log("ERROR: %s" % exc)
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    def close(self):
+        self.cancel.set()  # songs already converting finish; the rest are skipped
+        self.root.destroy()
 
     def open_output(self):
         usb = self.usb.get().strip()
