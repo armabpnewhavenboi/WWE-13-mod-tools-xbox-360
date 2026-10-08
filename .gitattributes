@@ -1,7 +1,9 @@
 *.bat text eol=crlf
 *.py text eol=lf
-*.sln text eol=crlf
-*.vcxproj text eol=crlf
+# Stored with Windows line endings as-is: Visual Studio 2010 rejects .sln files
+# with Unix line endings, e.g. when downloaded raw from GitHub.
+*.sln -text
+*.vcxproj -text
 *.cpp text eol=crlf
 *.xml text eol=crlf
 *.h text eol=crlf
