@@ -43,16 +43,23 @@ jobs:
         run: pyinstaller --noconfirm --onefile --windowed --name WWE13-Resigner launcher.py
       - name: Build command-line version
         run: pyinstaller --noconfirm --onefile --console --name x360resign launcher.py
+      - name: Build music converter (window and command-line)
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name HddMusic-Converter music_launcher.py
+          pyinstaller --noconfirm --onefile --console --name x360music music_launcher.py
       - name: Smoke test
         shell: pwsh
         run: |
           ./dist/x360resign.exe --version
           ./dist/x360resign.exe --help
+          ./dist/x360music.exe --version
+          ./dist/x360music.exe --help
       - name: Bundle
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          Copy-Item dist/WWE13-Resigner.exe, dist/x360resign.exe, README.md -Destination package
+          Copy-Item dist/WWE13-Resigner.exe, dist/x360resign.exe, dist/HddMusic-Converter.exe, dist/x360music.exe, README.md -Destination package
+          Copy-Item homebrew/HddMusic/README.md -Destination package/HddMusic-README.md
           Compress-Archive -Path package/* -DestinationPath WWE13-Resigner-windows.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -67,8 +74,8 @@ jobs:
         run: |
           gh release view "$env:TAG" *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload "$env:TAG" WWE13-Resigner-windows.zip dist/WWE13-Resigner.exe dist/x360resign.exe --clobber
+            gh release upload "$env:TAG" WWE13-Resigner-windows.zip dist/WWE13-Resigner.exe dist/x360resign.exe dist/HddMusic-Converter.exe dist/x360music.exe --clobber
           } else {
-            gh release create "$env:TAG" WWE13-Resigner-windows.zip dist/WWE13-Resigner.exe dist/x360resign.exe --title "$env:TAG" --notes "Windows build of x360resign. Download WWE13-Resigner.exe and double-click it. See README.md for instructions."
+            gh release create "$env:TAG" WWE13-Resigner-windows.zip dist/WWE13-Resigner.exe dist/x360resign.exe dist/HddMusic-Converter.exe dist/x360music.exe --title "$env:TAG" --notes "Windows build of x360resign. Download WWE13-Resigner.exe and double-click it. See README.md for instructions."
           }
           exit $LASTEXITCODE

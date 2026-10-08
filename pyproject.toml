@@ -5,16 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "x360resign"
 dynamic = ["version"]
-description = "Batch rehash and resign Xbox 360 saves (STFS CON packages) to your own profile - made for the WWE '13 Monday Night War save pack"
+description = "WWE '13 Xbox 360 mod tools: batch resign saves (STFS CON packages) to your own profile, and convert music for the hard-drive music library"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = []
 
 [project.scripts]
 x360resign = "x360resign.cli:main"
+x360music = "x360music.cli:main"
 
 [tool.setuptools]
-packages = ["x360resign"]
+packages = ["x360resign", "x360music"]
 
 [tool.setuptools.dynamic]
 version = { attr = "x360resign.__version__" }

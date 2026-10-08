@@ -250,9 +250,18 @@ stfschk (emoose).
 
 ---
 
-## Extra: music from the hard drive while you play
+## Extra: your own music on the Xbox hard drive
 
-[`homebrew/HddMusic`](homebrew/HddMusic/README.md) is a DashLaunch plugin
-(Visual Studio 2010 + XDK) for RGH/JTAG consoles. It copies music from a USB
-stick to the hard drive and plays it in the background during games, so the
-stick doesn't need to stay plugged in.
+[`homebrew/HddMusic`](homebrew/HddMusic/README.md) puts your MP3s in the
+console's hard-drive music library, the same place ripped CDs go. They then
+play from **Music Player > Hard Drive** and, through the Guide, during any
+game that allows custom soundtracks, with no USB stick needed.
+
+- **`x360music`** (in this repository; `HddMusic-Converter.exe` on Windows)
+  converts MP3s to the WMA format the console's CD ripper uses and puts them
+  on a USB stick. It needs ffmpeg.
+- **The HddMusic DashLaunch plugin** (Visual Studio 2010 + XDK) adds those
+  songs to the library when you hold **Back** and press **X**, like ripping a
+  CD.
+
+See [homebrew/HddMusic/README.md](homebrew/HddMusic/README.md) for the steps.

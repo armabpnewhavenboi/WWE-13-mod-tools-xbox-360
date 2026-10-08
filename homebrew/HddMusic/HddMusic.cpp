@@ -1,20 +1,15 @@
-// HddMusic - DashLaunch plugin that plays music from the internal hard drive
-// while you play games, without the USB stick plugged in.
+// HddMusic - DashLaunch plugin that "rips" songs from a USB stick into the
+// Xbox 360's hard-drive music library, as if they came from an audio CD.
 //
-//   Hdd:\Music\...       songs it plays (.mp3 / .wma, subfolders are fine)
-//   Usb:\Music\...       copied to Hdd:\Music by the "import" combo
+//   1. On a PC, "x360music convert" turns MP3s into WMA song files in
+//      <USB>\HddMusic\*.fmim (the format the console's CD ripper uses).
+//   2. Plug the stick in, hold BACK and press X on any controller.
+//   3. The songs are added to Hdd:\mindex, the library the dashboard rips CDs
+//      into. After a restart they show up under Music Player > Hard Drive and
+//      can be played in any game through the Guide, like ripped CDs.
 //
-// Controls (any controller, hold BACK and press):
-//   D-pad Up      play / pause
-//   D-pad Right   next song
-//   D-pad Left    previous song
-//   D-pad Down    stop
-//   X             import music from USB, then you can remove the stick
-//
-// Songs are played through the system media player (XMP) as a title
-// playlist, the same mechanism games use for their own soundtracks. Because a
-// title playlist belongs to the running game, the plugin rebuilds it after
-// each game launch and carries on playing if music was on.
+// The library format code is in MusicLibrary.cpp, which is tested on a PC
+// against the Python version in x360music/mindex.py.
 //
 // Build as an Xbox 360 DLL with the XDK (see README.md) and load it with
 // DashLaunch (plugin1 = Hdd:\Plugins\HddMusic.xex in launch.ini).
@@ -24,17 +19,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "MusicLibrary.h"
+
+using namespace MusicLibrary;
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-#define HM_SHUFFLE          0       // 1 = shuffle, 0 = play in folder order
 #define HM_COMBO_HOLD       XINPUT_GAMEPAD_BACK
-#define HM_MAX_SONGS        2000
-#define HM_MAX_DEPTH        4       // how many subfolder levels to scan
+#define HM_COMBO_PRESS      XINPUT_GAMEPAD_X
 #define HM_BOOT_DELAY_MS    10000   // let the dashboard finish loading first
-#define HM_RESUME_DELAY_MS  6000    // wait after a game launch before resuming
 #define HM_POLL_MS          50
+#define HM_BATCH            128     // song headers read and sorted at a time
 
 // ---------------------------------------------------------------------------
 // Kernel / XAM imports that the public XDK headers don't declare
@@ -57,54 +54,52 @@ extern "C" {
     DWORD XexGetProcedureAddress(HANDLE module, DWORD ordinal, PVOID* address);
 }
 
-#define EX_CREATE_FLAG_SYSTEM       0x2
-#define XAM_ORD_GETCURRENTTITLEID   463
-#define XAM_ORD_XNOTIFYQUEUEUI      656
+#define EX_CREATE_FLAG_SYSTEM   0x2
+#define XAM_ORD_XNOTIFYQUEUEUI  656
 
-typedef DWORD (*PFN_XAMGETCURRENTTITLEID)(VOID);
-typedef VOID  (*PFN_XNOTIFYQUEUEUI)(DWORD type, DWORD userIndex, ULONGLONG areas,
-                                    LPCWSTR text, PVOID context);
+typedef VOID (*PFN_XNOTIFYQUEUEUI)(DWORD type, DWORD userIndex, ULONGLONG areas,
+                                   LPCWSTR text, PVOID context);
 
-static PFN_XAMGETCURRENTTITLEID pXamGetCurrentTitleId = NULL;
-static PFN_XNOTIFYQUEUEUI       pXNotifyQueueUI       = NULL;
+static PFN_XNOTIFYQUEUEUI pXNotifyQueueUI = NULL;
+static volatile BOOL      g_running = TRUE;
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
-struct Song {
-    WCHAR*         path;    // HmHdd:\Music\...  (what XMP opens)
-    WCHAR*         title;   // file name without extension
-    WCHAR*         folder;  // parent folder name, shown as the album
-    XMP_SONGFORMAT format;
-};
-
-static volatile BOOL g_running = TRUE;
-static Song*         g_songs = NULL;
-static DWORD         g_songCount = 0;
-static XMP_HANDLE    g_playlist = NULL;
-static XMP_HANDLE*   g_songHandles = NULL;
-static BOOL          g_wantPlaying = FALSE;  // music was on when the game changed
-static DWORD         g_resumeAt = 0;
-static DWORD         g_titleId = 0;
-
-static const char* HDD_MUSIC = "HmHdd:\\Music";
-static const char* USB_MUSIC[] = { "HmUsb0:\\Music", "HmUsb1:\\Music", "HmUsb2:\\Music" };
+static const char* USB_FOLDERS[] = { "HmUsb0:\\HddMusic", "HmUsb1:\\HddMusic", "HmUsb2:\\HddMusic" };
+static const char* LIBRARY_DIRS[] = { "HmHdd:\\mindex", "HmHdd:\\Content\\mindex" };
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+static DWORD WINAPI NotifyThread(LPVOID text)
+{
+    pXNotifyQueueUI(14, 0, 2, (LPCWSTR)text, NULL);  // 14 = custom text, 2 = high priority
+    free(text);
+    return 0;
+}
+
+// XNotifyQueueUI is meant to be called from a title thread, and ours is a
+// system thread, so each notification gets a short-lived title thread.
 static void Notify(LPCWSTR fmt, ...)
 {
     if (!pXNotifyQueueUI)
         return;
-    WCHAR text[128];
+    WCHAR* text = (WCHAR*)malloc(160 * sizeof(WCHAR));
+    if (!text)
+        return;
     va_list args;
     va_start(args, fmt);
-    _vsnwprintf_s(text, _countof(text), _TRUNCATE, fmt, args);
+    _vsnwprintf_s(text, 160, _TRUNCATE, fmt, args);
     va_end(args);
-    pXNotifyQueueUI(14, 0, 2, text, NULL);  // 14 = custom text, 2 = high priority
+
+    HANDLE thread = NULL;
+    DWORD threadId;
+    DWORD status = ExCreateThread(&thread, 0, &threadId, (VOID*)XapiThreadStartup,
+                                  NotifyThread, text, 0);
+    if ((LONG)status < 0 || !thread) {
+        free(text);
+        return;
+    }
+    CloseHandle(thread);
 }
 
 static void Mount(const char* link, const char* device)
@@ -129,233 +124,56 @@ static void ResolveXamImports()
     HANDLE xam = NULL;
     if (XexGetModuleHandle("xam.xex", &xam) != 0 || !xam)
         return;
-    XexGetProcedureAddress(xam, XAM_ORD_GETCURRENTTITLEID, (PVOID*)&pXamGetCurrentTitleId);
     XexGetProcedureAddress(xam, XAM_ORD_XNOTIFYQUEUEUI, (PVOID*)&pXNotifyQueueUI);
 }
 
-static DWORD CurrentTitleId()
+static BOOL Exists(const char* path)
 {
-    return pXamGetCurrentTitleId ? pXamGetCurrentTitleId() : 0;
+    return GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-// FAT names on the 360 are single-byte; widen them byte for byte.
-static WCHAR* Widen(const char* s, size_t len)
+// Reads at most `limit` bytes (0 = the whole file) into a malloc'd buffer.
+static unsigned char* ReadWholeFile(const char* path, DWORD limit, DWORD* size)
 {
-    WCHAR* w = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
-    if (!w)
+    HANDLE file = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
         return NULL;
-    for (size_t i = 0; i < len; i++)
-        w[i] = (WCHAR)(unsigned char)s[i];
-    w[len] = 0;
-    return w;
+    DWORD length = GetFileSize(file, NULL);
+    if (length == INVALID_FILE_SIZE || (limit && length < limit)) {
+        CloseHandle(file);
+        return NULL;
+    }
+    if (limit)
+        length = limit;
+    unsigned char* data = (unsigned char*)malloc(length ? length : 1);
+    DWORD read = 0;
+    if (!data || !ReadFile(file, data, length, &read, NULL) || read != length) {
+        free(data);
+        data = NULL;
+    }
+    CloseHandle(file);
+    *size = length;
+    return data;
 }
 
-static BOOL SongFormat(const char* name, XMP_SONGFORMAT* format)
+static BOOL WriteWholeFile(const char* path, const unsigned char* data, DWORD size)
 {
-    const char* dot = strrchr(name, '.');
-    if (!dot)
+    HANDLE file = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
         return FALSE;
-    if (_stricmp(dot, ".mp3") == 0) { *format = XMP_SONGFORMAT_MP3; return TRUE; }
-    if (_stricmp(dot, ".wma") == 0) { *format = XMP_SONGFORMAT_WMA; return TRUE; }
-    return FALSE;
+    DWORD written = 0;
+    BOOL ok = WriteFile(file, data, size, &written, NULL) && written == size;
+    CloseHandle(file);
+    if (!ok)
+        DeleteFile(path);
+    return ok;
 }
 
-static BOOL IsDots(const char* name)
-{
-    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
-}
-
-// ---------------------------------------------------------------------------
-// Song list
-// ---------------------------------------------------------------------------
-
-static void FreeSongs()
-{
-    for (DWORD i = 0; i < g_songCount; i++) {
-        free(g_songs[i].path);
-        free(g_songs[i].title);
-        free(g_songs[i].folder);
-    }
-    free(g_songs);
-    g_songs = NULL;
-    g_songCount = 0;
-}
-
-static void AddSong(const char* fullPath, const char* fileName, const char* folder,
-                    XMP_SONGFORMAT format)
-{
-    if (g_songCount >= HM_MAX_SONGS)
-        return;
-    if (g_songCount == 0)
-        g_songs = (Song*)malloc(HM_MAX_SONGS * sizeof(Song));
-    if (!g_songs)
-        return;
-
-    Song& s = g_songs[g_songCount];
-    s.path = Widen(fullPath, strlen(fullPath));
-    s.title = Widen(fileName, strrchr(fileName, '.') - fileName);
-    s.folder = Widen(folder, strlen(folder));
-    s.format = format;
-    if (!s.path || !s.title || !s.folder) {
-        free(s.path); free(s.title); free(s.folder);
-        return;
-    }
-    g_songCount++;
-}
-
-static void ScanDir(const char* dir, const char* folderName, int depth)
-{
-    char pattern[MAX_PATH];
-    sprintf_s(pattern, "%s\\*", dir);
-
-    WIN32_FIND_DATA fd;
-    HANDLE find = FindFirstFile(pattern, &fd);
-    if (find == INVALID_HANDLE_VALUE)
-        return;
-    do {
-        if (IsDots(fd.cFileName))
-            continue;
-        char full[MAX_PATH];
-        sprintf_s(full, "%s\\%s", dir, fd.cFileName);
-
-        XMP_SONGFORMAT format;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (depth < HM_MAX_DEPTH)
-                ScanDir(full, fd.cFileName, depth + 1);
-        } else if (SongFormat(fd.cFileName, &format)) {
-            AddSong(full, fd.cFileName, folderName, format);
-        }
-    } while (FindNextFile(find, &fd));
-    FindClose(find);
-}
-
-static int CompareSongs(const void* a, const void* b)
-{
-    return _wcsicmp(((const Song*)a)->path, ((const Song*)b)->path);
-}
-
-static void ScanSongs()
-{
-    FreeSongs();
-    ScanDir(HDD_MUSIC, "Music", 0);
-    if (g_songCount > 1)
-        qsort(g_songs, g_songCount, sizeof(Song), CompareSongs);
-}
-
-// ---------------------------------------------------------------------------
-// Playback
-// ---------------------------------------------------------------------------
-
-static void FreePlaylist()
-{
-    if (g_playlist)
-        XMPDeleteTitlePlaylist(g_playlist);  // fails harmlessly if the game that owned it exited
-    g_playlist = NULL;
-    free(g_songHandles);
-    g_songHandles = NULL;
-}
-
-static BOOL BuildPlaylist()
-{
-    FreePlaylist();
-    if (g_songCount == 0)
-        return FALSE;
-
-    XMP_SONGDESCRIPTOR* desc = (XMP_SONGDESCRIPTOR*)calloc(g_songCount, sizeof(XMP_SONGDESCRIPTOR));
-    g_songHandles = (XMP_HANDLE*)calloc(g_songCount, sizeof(XMP_HANDLE));
-    if (!desc || !g_songHandles) {
-        free(desc);
-        FreePlaylist();
-        return FALSE;
-    }
-    for (DWORD i = 0; i < g_songCount; i++) {
-        desc[i].pwszFilePath = g_songs[i].path;
-        desc[i].pwszTitle = g_songs[i].title;
-        desc[i].pwszArtist = L"";
-        desc[i].pwszAlbum = g_songs[i].folder;
-        desc[i].pwszAlbumArtist = L"";
-        desc[i].pwszGenre = L"";
-        desc[i].dwTrackNumber = i + 1;
-        desc[i].dwDuration = 0;
-        desc[i].eSongFormat = g_songs[i].format;
-    }
-    DWORD result = XMPCreateTitlePlaylist(desc, g_songCount, XMP_CREATEPLAYLISTFLAG_NONE,
-                                          L"HddMusic", g_songHandles, &g_playlist);
-    free(desc);
-    if (result != ERROR_SUCCESS) {
-        g_playlist = NULL;
-        FreePlaylist();
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static void StartPlayback()
-{
-    if (g_songCount == 0)
-        ScanSongs();
-    if (g_songCount == 0) {
-        Notify(L"HddMusic: no .mp3/.wma files in Hdd:\\Music");
-        return;
-    }
-    if (!g_playlist && !BuildPlaylist()) {
-        Notify(L"HddMusic: couldn't create the playlist");
-        return;
-    }
-    XMPSetPlaybackBehavior(HM_SHUFFLE ? XMP_PLAYBACKMODE_SHUFFLE : XMP_PLAYBACKMODE_INORDER,
-                           XMP_REPEATMODE_PLAYLIST, 0, NULL);
-    DWORD first = HM_SHUFFLE ? (GetTickCount() % g_songCount) : 0;
-    if (XMPPlayTitlePlaylist(g_playlist, g_songHandles[first], NULL) == ERROR_SUCCESS) {
-        g_wantPlaying = TRUE;
-        Notify(L"HddMusic: playing %u songs", g_songCount);
-    } else {
-        // The game may have locked background music, or the handle went stale.
-        FreePlaylist();
-        Notify(L"HddMusic: couldn't start (this game may block custom music)");
-    }
-}
-
-static void PlayPause()
-{
-    XMP_STATE state = XMP_STATE_IDLE;
-    XMPGetStatus(&state);
-    if (state == XMP_STATE_PLAYING) {
-        XMPPause(NULL);
-        g_wantPlaying = FALSE;
-    } else if (state == XMP_STATE_PAUSED && g_playlist) {
-        XMPContinue(NULL);
-        g_wantPlaying = TRUE;
-    } else {
-        StartPlayback();
-    }
-}
-
-static void Stop()
-{
-    XMPStop(NULL);
-    g_wantPlaying = FALSE;
-    g_resumeAt = 0;
-}
-
-// ---------------------------------------------------------------------------
-// Import from USB
-// ---------------------------------------------------------------------------
-
-static BYTE* g_copyBuffer = NULL;
 #define HM_COPY_BUFFER_SIZE (256 * 1024)
 
-static BOOL FileSize(const char* path, DWORD* size)
-{
-    WIN32_FIND_DATA fd;
-    HANDLE find = FindFirstFile(path, &fd);
-    if (find == INVALID_HANDLE_VALUE)
-        return FALSE;
-    FindClose(find);
-    *size = fd.nFileSizeLow;
-    return TRUE;
-}
-
-static BOOL CopyOneFile(const char* src, const char* dst)
+static BOOL CopyOneFile(const char* src, const char* dst, BYTE* buffer)
 {
     HANDLE in = CreateFile(src, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -371,10 +189,10 @@ static BOOL CopyOneFile(const char* src, const char* dst)
     BOOL ok = TRUE;
     for (;;) {
         DWORD read = 0, written = 0;
-        if (!ReadFile(in, g_copyBuffer, HM_COPY_BUFFER_SIZE, &read, NULL)) { ok = FALSE; break; }
+        if (!ReadFile(in, buffer, HM_COPY_BUFFER_SIZE, &read, NULL)) { ok = FALSE; break; }
         if (read == 0)
             break;
-        if (!WriteFile(out, g_copyBuffer, read, &written, NULL) || written != read) { ok = FALSE; break; }
+        if (!WriteFile(out, buffer, read, &written, NULL) || written != read) { ok = FALSE; break; }
     }
     CloseHandle(out);
     CloseHandle(in);
@@ -383,103 +201,247 @@ static BOOL CopyOneFile(const char* src, const char* dst)
     return ok;
 }
 
-static void CopyTree(const char* src, const char* dst, int depth,
-                     DWORD* copied, DWORD* skipped, DWORD* failed)
+// ---------------------------------------------------------------------------
+// Ripping from USB
+// ---------------------------------------------------------------------------
+
+struct SongFile {
+    char name[MAX_PATH];
+    unsigned char header[FMIM_HEADER_SIZE];
+};
+
+static int CompareSongFiles(const void* a, const void* b)
 {
-    CreateDirectory(dst, NULL);
-
-    char pattern[MAX_PATH];
-    sprintf_s(pattern, "%s\\*", src);
-    WIN32_FIND_DATA fd;
-    HANDLE find = FindFirstFile(pattern, &fd);
-    if (find == INVALID_HANDLE_VALUE)
-        return;
-    do {
-        if (IsDots(fd.cFileName))
-            continue;
-        char from[MAX_PATH], to[MAX_PATH];
-        sprintf_s(from, "%s\\%s", src, fd.cFileName);
-        sprintf_s(to, "%s\\%s", dst, fd.cFileName);
-
-        XMP_SONGFORMAT format;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (depth < HM_MAX_DEPTH)
-                CopyTree(from, to, depth + 1, copied, skipped, failed);
-        } else if (SongFormat(fd.cFileName, &format)) {
-            DWORD existing;
-            if (FileSize(to, &existing) && existing == fd.nFileSizeLow)
-                (*skipped)++;
-            else if (CopyOneFile(from, to))
-                (*copied)++;
-            else
-                (*failed)++;
-        }
-    } while (FindNextFile(find, &fd));
-    FindClose(find);
+    const SongFile* x = (const SongFile*)a;
+    const SongFile* y = (const SongFile*)b;
+    int result = CompareSongs(x->header, y->header);
+    return result ? result : strcmp(x->name, y->name);
 }
 
-static void ImportFromUsb()
+struct Import {
+    Library      library;
+    char         usbDir[64];
+    char         libraryDir[64];
+    BYTE*        copyBuffer;
+    DWORD*       copied;       // record numbers of song files copied this run
+    DWORD        copiedCount;
+    DWORD        added, skipped, failed;
+    Result       error;
+};
+
+static void MediaPath(const Import& import, DWORD index, char* path, size_t size)
 {
-    if (!g_copyBuffer)
-        g_copyBuffer = (BYTE*)malloc(HM_COPY_BUFFER_SIZE);
-    if (!g_copyBuffer)
-        return;
+    sprintf_s(path, size, "%s\\media\\0000\\%04X", import.libraryDir, index);
+}
 
-    DWORD copied = 0, skipped = 0, failed = 0;
-    BOOL found = FALSE;
-    for (int i = 0; i < _countof(USB_MUSIC); i++) {
-        if (GetFileAttributes(USB_MUSIC[i]) == INVALID_FILE_ATTRIBUTES)
+static void DeleteCopiedSongs(Import& import)
+{
+    char path[MAX_PATH];
+    for (DWORD i = 0; i < import.copiedCount; i++) {
+        MediaPath(import, import.copied[i], path, sizeof(path));
+        DeleteFile(path);
+    }
+    import.copiedCount = 0;
+}
+
+// Adds one batch of songs, sorted album by album.  Returns FALSE to stop.
+static BOOL AddBatch(Import& import, SongFile* songs, DWORD count)
+{
+    qsort(songs, count, sizeof(SongFile), CompareSongFiles);
+    for (DWORD i = 0; i < count; i++) {
+        unsigned int planned, index;
+        Result result = import.library.PlanSong(songs[i].header, &planned);
+        if (result == RESULT_DUPLICATE) {
+            import.skipped++;
             continue;
-        if (!found)
-            Notify(L"HddMusic: copying music from USB...");
-        found = TRUE;
-        CopyTree(USB_MUSIC[i], HDD_MUSIC, 0, &copied, &skipped, &failed);
-    }
-    free(g_copyBuffer);
-    g_copyBuffer = NULL;
+        }
+        if (result == RESULT_OK && planned >= MAX_RECORDS)
+            result = RESULT_FULL;
+        if (result == RESULT_NOT_FMIM) {
+            import.failed++;
+            continue;
+        }
+        if (result != RESULT_OK) {
+            import.error = result;
+            return FALSE;
+        }
 
-    if (!found) {
-        Notify(L"HddMusic: no Music folder found on the USB stick");
+        // Copy the song first, so a failed copy never ends up in the library.
+        char from[MAX_PATH], to[MAX_PATH];
+        sprintf_s(from, "%s\\%s", import.usbDir, songs[i].name);
+        MediaPath(import, planned, to, sizeof(to));
+        if (!CopyOneFile(from, to, import.copyBuffer)) {
+            import.failed++;
+            continue;
+        }
+        import.copied[import.copiedCount++] = planned;
+
+        result = import.library.AddSong(songs[i].header, &index);
+        if (result != RESULT_OK || index != planned) {
+            import.error = result != RESULT_OK ? result : RESULT_BAD_LIBRARY;
+            return FALSE;
+        }
+        import.added++;
+    }
+    return TRUE;
+}
+
+static BOOL OpenLibrary(Import& import, BOOL* existed)
+{
+    // Use whichever library folder exists, or make the standard one.
+    strcpy_s(import.libraryDir, LIBRARY_DIRS[0]);
+    for (int i = 0; i < _countof(LIBRARY_DIRS); i++) {
+        if (Exists(LIBRARY_DIRS[i])) {
+            strcpy_s(import.libraryDir, LIBRARY_DIRS[i]);
+            break;
+        }
+    }
+
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\mindex.xmi", import.libraryDir);
+    *existed = Exists(path);
+    if (*existed) {
+        DWORD size = 0;
+        unsigned char* data = ReadWholeFile(path, 0, &size);
+        if (!data) {
+            Notify(L"HddMusic: can't read the music library. Restart and try again.");
+            return FALSE;
+        }
+        import.error = import.library.Load(data, size);
+        free(data);
+    } else {
+        import.error = import.library.CreateNew();
+    }
+    if (import.error != RESULT_OK)
+        return FALSE;
+
+    CreateDirectory(import.libraryDir, NULL);
+    sprintf_s(path, "%s\\media", import.libraryDir);
+    CreateDirectory(path, NULL);
+    sprintf_s(path, "%s\\media\\0000", import.libraryDir);
+    CreateDirectory(path, NULL);
+    return Exists(path);
+}
+
+static void RipFromUsb()
+{
+    Import* import = new Import();
+    if (!import)
+        return;
+    import->copyBuffer = NULL;
+    import->copied = NULL;
+    import->copiedCount = import->added = import->skipped = import->failed = 0;
+    import->error = RESULT_OK;
+
+    import->usbDir[0] = 0;
+    for (int i = 0; i < _countof(USB_FOLDERS); i++) {
+        if (Exists(USB_FOLDERS[i])) {
+            strcpy_s(import->usbDir, USB_FOLDERS[i]);
+            break;
+        }
+    }
+    if (!import->usbDir[0]) {
+        Notify(L"HddMusic: no HddMusic folder on the USB stick. Run x360music convert first.");
+        delete import;
         return;
     }
-    if (failed)
-        Notify(L"HddMusic: copied %u, %u already there, %u FAILED", copied, skipped, failed);
-    else
-        Notify(L"HddMusic: copied %u songs (%u already there). You can remove the USB.",
-               copied, skipped);
 
-    ScanSongs();
-    if (!g_wantPlaying)
-        FreePlaylist();  // pick up the new songs on the next play
+    BOOL existed = FALSE;
+    SongFile* batch = (SongFile*)malloc(HM_BATCH * sizeof(SongFile));
+    import->copyBuffer = (BYTE*)malloc(HM_COPY_BUFFER_SIZE);
+    import->copied = (DWORD*)malloc(MAX_RECORDS * sizeof(DWORD));
+    if (!batch || !import->copyBuffer || !import->copied) {
+        Notify(L"HddMusic: out of memory");
+        goto done;
+    }
+    if (!OpenLibrary(*import, &existed)) {
+        if (import->error != RESULT_OK)
+            Notify(L"HddMusic: %S. Nothing was changed.", ResultText(import->error));
+        else
+            Notify(L"HddMusic: can't create the music folder on the hard drive.");
+        goto done;
+    }
+
+    Notify(L"HddMusic: ripping songs from USB to the hard drive...");
+    {
+        char path[MAX_PATH];
+        sprintf_s(path, "%s\\*.fmim", import->usbDir);
+        WIN32_FIND_DATA fd;
+        HANDLE find = FindFirstFile(path, &fd);
+        BOOL keepGoing = TRUE;
+        DWORD count = 0;
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    continue;
+                sprintf_s(path, "%s\\%s", import->usbDir, fd.cFileName);
+                DWORD size;
+                unsigned char* header = ReadWholeFile(path, FMIM_HEADER_SIZE, &size);
+                if (!header || !IsSongHeader(header, size)) {
+                    free(header);
+                    import->failed++;
+                    continue;
+                }
+                strcpy_s(batch[count].name, fd.cFileName);
+                memcpy(batch[count].header, header, FMIM_HEADER_SIZE);
+                free(header);
+                if (++count == HM_BATCH) {
+                    keepGoing = AddBatch(*import, batch, count);
+                    count = 0;
+                }
+            } while (keepGoing && FindNextFile(find, &fd));
+            FindClose(find);
+        }
+        if (keepGoing && count)
+            AddBatch(*import, batch, count);
+    }
+
+    if (import->error != RESULT_OK) {
+        DeleteCopiedSongs(*import);
+        Notify(L"HddMusic: %S. Nothing was changed.", ResultText(import->error));
+        goto done;
+    }
+    if (import->added == 0) {
+        Notify(L"HddMusic: nothing new to add (%u already in the library, %u failed).",
+               import->skipped, import->failed);
+        goto done;
+    }
+
+    {
+        char path[MAX_PATH], backup[MAX_PATH];
+        sprintf_s(path, "%s\\mindex.xmi", import->libraryDir);
+        sprintf_s(backup, "%s\\mindex.xmi.bak", import->libraryDir);
+        if (existed && !CopyOneFile(path, backup, import->copyBuffer)) {
+            DeleteCopiedSongs(*import);
+            Notify(L"HddMusic: can't back up the music library. Nothing was changed.");
+            goto done;
+        }
+        if (!WriteWholeFile(path, import->library.Data(), import->library.Size())) {
+            if (existed)
+                CopyOneFile(backup, path, import->copyBuffer);
+            DeleteCopiedSongs(*import);
+            Notify(L"HddMusic: can't save the music library (is the Music Player open?). "
+                   L"Nothing was changed.");
+            goto done;
+        }
+    }
+    if (import->failed)
+        Notify(L"HddMusic: added %u songs, %u FAILED. Restart the console to see them.",
+               import->added, import->failed);
+    else
+        Notify(L"HddMusic: added %u songs (%u already there). Restart the console to see them.",
+               import->added, import->skipped);
+
+done:
+    free(batch);
+    free(import->copyBuffer);
+    free(import->copied);
+    delete import;
 }
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
-
-static void WatchTitle()
-{
-    DWORD title = CurrentTitleId();
-    if (title == g_titleId)
-        return;
-    g_titleId = title;
-
-    // The old playlist belonged to the previous game.
-    g_playlist = NULL;
-    free(g_songHandles);
-    g_songHandles = NULL;
-    if (g_wantPlaying)
-        g_resumeAt = GetTickCount() + HM_RESUME_DELAY_MS;
-}
-
-static void HandleButtons(WORD pressed)
-{
-    if (pressed & XINPUT_GAMEPAD_DPAD_UP)    PlayPause();
-    if (pressed & XINPUT_GAMEPAD_DPAD_DOWN)  Stop();
-    if (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) { XMPNext(NULL); }
-    if (pressed & XINPUT_GAMEPAD_DPAD_LEFT)  { XMPPrevious(NULL); }
-    if (pressed & XINPUT_GAMEPAD_X)          ImportFromUsb();
-}
 
 static DWORD WINAPI MainThread(LPVOID)
 {
@@ -490,18 +452,9 @@ static DWORD WINAPI MainThread(LPVOID)
     Mount("HmUsb0:", "\\Device\\Mass0");
     Mount("HmUsb1:", "\\Device\\Mass1");
     Mount("HmUsb2:", "\\Device\\Mass2");
-    CreateDirectory(HDD_MUSIC, NULL);
-    g_titleId = CurrentTitleId();
 
     WORD previous[XUSER_MAX_COUNT] = { 0 };
     while (g_running) {
-        WatchTitle();
-
-        if (g_resumeAt && (LONG)(GetTickCount() - g_resumeAt) >= 0) {
-            g_resumeAt = 0;
-            StartPlayback();
-        }
-
         for (DWORD pad = 0; pad < XUSER_MAX_COUNT; pad++) {
             XINPUT_STATE state;
             WORD buttons = 0;
@@ -509,8 +462,8 @@ static DWORD WINAPI MainThread(LPVOID)
                 buttons = state.Gamepad.wButtons;
             WORD pressed = buttons & ~previous[pad];
             previous[pad] = buttons;
-            if ((buttons & HM_COMBO_HOLD) && (pressed & ~HM_COMBO_HOLD))
-                HandleButtons(pressed);
+            if ((buttons & HM_COMBO_HOLD) && (pressed & HM_COMBO_PRESS))
+                RipFromUsb();
         }
         Sleep(HM_POLL_MS);
     }

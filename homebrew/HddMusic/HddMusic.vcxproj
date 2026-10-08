@@ -96,6 +96,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="HddMusic.cpp" />
+    <ClCompile Include="MusicLibrary.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="MusicLibrary.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />
