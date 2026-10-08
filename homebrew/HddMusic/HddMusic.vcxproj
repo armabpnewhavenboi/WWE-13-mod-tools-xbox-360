@@ -65,6 +65,7 @@
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalOptions>/dll %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>xapilibd.lib;xboxkrnl.lib;xnetd.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ImageXex>
@@ -86,6 +87,7 @@
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalOptions>/dll %(AdditionalOptions)</AdditionalOptions>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <AdditionalDependencies>xapilib.lib;xboxkrnl.lib;xnet.lib;%(AdditionalDependencies)</AdditionalDependencies>
