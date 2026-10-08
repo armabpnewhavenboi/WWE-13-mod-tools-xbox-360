@@ -29,7 +29,7 @@ lists are:
 Names are UTF-16BE at 0x10, at most 39 characters plus a terminating zero.
 A track also holds its playlist entries at 0x84/0x88/0x8C (0xFFFFFFFF,
 0xFFFFFFFF, 0 when it is in no playlist) and at 0x90 a u32 made of the length
-in half-milliseconds (24 bits) and a byte 1 + 4 * track number.
+in half-milliseconds (24 bits) and a byte 1 + 4 * track number (at most 63).
 
 Record layout from the Xbox-360-Mindex project by Lyall-A, whose generated
 libraries play on real consoles.  The plugin in homebrew/HddMusic has a C++
@@ -51,6 +51,7 @@ NAME = 0x10
 NAME_UNITS = 39
 TRACK_INFO = 0x90
 MAX_RECORDS = 0x10000  # song files are named with four hex digits
+MAX_TRACK_NUMBER = 63  # six bits in the track record
 
 UNKNOWN_SONG = "Unknown Song"
 UNKNOWN_ALBUM = "Unknown Album"
@@ -244,14 +245,17 @@ class Library(object):
         return self.find(ALBUM, album, lambda i: self.u32(i, 0x74) == album_artist_index)
 
     def find_song(self, info):
-        """Record number of a track already in the library, or None."""
+        """Record number of a track already in the library, or None.  Same
+        title, album, artists and (when the song has one) track number."""
         title, album, artist, album_artist, _ = song_names(info)
         artist_index = self.find(ARTIST, artist)
         album_index = self._find_album(album, self.find(ARTIST, album_artist))
         if artist_index is None or album_index is None:
             return None
+        number = min(info.track_number, MAX_TRACK_NUMBER)
         return self.find(TRACK, title, lambda i: self.u32(i, 0x68) == album_index
-                         and self.u32(i, 0x74) == artist_index)
+                         and self.u32(i, 0x74) == artist_index
+                         and (number == 0 or self.track_number(i) == number))
 
     def plan_song(self, info):
         """Record number add_song() would give this song, or None if it is already there."""
@@ -322,12 +326,13 @@ class Library(object):
         number = info.track_number
         if number == 0:
             number = self.u32(album_index, ALBUM_TRACKS.count) + 1
+        number = min(number, MAX_TRACK_NUMBER)
         half_ms = min(info.length_ms * 2, 0xFFFFFF)
         index = self._new_record(TRACK, title)
         self.set_u32(index, 0x84, NONE)
         self.set_u32(index, 0x88, NONE)
         self.set_u32(index, 0x8C, 0)
-        self.set_u32(index, TRACK_INFO, (half_ms << 8) | (1 + 4 * (number & 0x3F)))
+        self.set_u32(index, TRACK_INFO, (half_ms << 8) | (1 + 4 * number))
         self._insert(self.heads[TRACK], GLOBAL, index, self._name_key)
         self._insert(album_index, ALBUM_TRACKS, index, self._album_track_key)
         self._insert(artist_index, ARTIST_TRACKS, index, self._name_key)
@@ -391,7 +396,9 @@ class Library(object):
         result = []
         for album in self.members(self.heads[ALBUM], GLOBAL):
             for track in self.members(album, ALBUM_TRACKS):
-                result.append((track, self.name(track), self.name(album),
-                               self.name(self.u32(track, 0x74)), self.track_number(track),
-                               self.length_ms(track)))
+                artist = self.u32(track, 0x74)
+                if artist >= len(self.records):
+                    raise MindexError("track %d points to record %d as its artist" % (track, artist))
+                result.append((track, self.name(track), self.name(album), self.name(artist),
+                               self.track_number(track), self.length_ms(track)))
         return result

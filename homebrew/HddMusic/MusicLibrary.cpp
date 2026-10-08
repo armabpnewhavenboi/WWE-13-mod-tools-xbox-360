@@ -32,6 +32,7 @@ const unsigned int NONE       = 0xFFFFFFFF;
 const unsigned int NAME       = 0x10;
 const unsigned int NAME_UNITS = 39;
 const unsigned int TRACK_INFO = 0x90;
+const unsigned int MAX_TRACK_NUMBER = 63;  // six bits in the track record
 
 // FMIM header fields
 const unsigned int FMIM_TITLE        = 0x00C;
@@ -200,13 +201,15 @@ unsigned int Library::TrackNumber(unsigned int index) const
     return (m_data[index * RECORD_SIZE + TRACK_INFO + 3] >> 2) & 0x3F;
 }
 
+// Grows in small steps: a big library can be tens of megabytes, and the
+// console doesn't have room for a doubled copy.
 bool Library::Reserve(unsigned int records)
 {
     if (records <= m_capacity)
         return true;
-    unsigned int capacity = m_capacity ? m_capacity * 2 : 64;
-    if (capacity < records)
-        capacity = records;
+    unsigned int capacity = records + 256;
+    if (capacity > MAX_RECORDS)
+        capacity = records > MAX_RECORDS ? records : MAX_RECORDS;
     unsigned char* data = (unsigned char*)realloc(m_data, capacity * RECORD_SIZE);
     if (!data)
         return false;
@@ -300,13 +303,23 @@ unsigned int Library::FindAlbum(const Name& album, unsigned int albumArtist) con
     return albumArtist ? Find(TYPE_ALBUM, album, 0x74, albumArtist) : 0;
 }
 
+// Same title, album, artists and (when the song has one) track number.
 unsigned int Library::FindSong(const Song& song) const
 {
     unsigned int artist = Find(TYPE_ARTIST, song.artist);
     unsigned int album = FindAlbum(song.album, Find(TYPE_ARTIST, song.albumArtist));
     if (!artist || !album)
         return 0;
-    return Find(TYPE_TRACK, song.title, 0x68, album, 0x74, artist);
+    unsigned int number = song.trackNumber < MAX_TRACK_NUMBER ? song.trackNumber : MAX_TRACK_NUMBER;
+    Name other;
+    for (unsigned int index = 0; index < m_count; index++) {
+        if (Type(index) != TYPE_TRACK || U32(index, 0x68) != album || U32(index, 0x74) != artist)
+            continue;
+        GetName(index, &other);
+        if (CompareNames(other, song.title) == 0 && (number == 0 || TrackNumber(index) == number))
+            return index;
+    }
+    return 0;
 }
 
 Result Library::ParseSong(const unsigned char* header, Song* song) const
@@ -481,12 +494,14 @@ Result Library::AddSong(const unsigned char* fmimHeader, unsigned int* index)
     unsigned int number = song.trackNumber;
     if (number == 0)
         number = U32(album, ALBUM_TRACKS.count) + 1;
+    if (number > MAX_TRACK_NUMBER)
+        number = MAX_TRACK_NUMBER;
     unsigned int halfMs = song.lengthMs > 0x7FFFFF ? 0xFFFFFF : song.lengthMs * 2;
     unsigned int track = NewRecord(TYPE_TRACK, song.title);
     SetU32(track, 0x84, NONE);
     SetU32(track, 0x88, NONE);
     SetU32(track, 0x8C, 0);
-    SetU32(track, TRACK_INFO, (halfMs << 8) | (1 + 4 * (number & 0x3F)));
+    SetU32(track, TRACK_INFO, (halfMs << 8) | (1 + 4 * number));
     if ((result = Insert(m_heads[TYPE_TRACK], GLOBAL, track, KEY_NAME)) != RESULT_OK ||
         (result = Insert(album, ALBUM_TRACKS, track, KEY_ALBUM_TRACK)) != RESULT_OK ||
         (result = Insert(artist, ARTIST_TRACKS, track, KEY_NAME)) != RESULT_OK ||

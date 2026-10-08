@@ -23,6 +23,14 @@
 
 using namespace MusicLibrary;
 
+// Not in the Xbox 360 headers.
+#ifndef INVALID_FILE_ATTRIBUTES
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#endif
+#ifndef INVALID_FILE_SIZE
+#define INVALID_FILE_SIZE ((DWORD)-1)
+#endif
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -54,7 +62,8 @@ extern "C" {
     DWORD XexGetProcedureAddress(HANDLE module, DWORD ordinal, PVOID* address);
 }
 
-#define EX_CREATE_FLAG_SYSTEM   0x2
+#define EX_CREATE_FLAG_SUSPENDED 0x1
+#define EX_CREATE_FLAG_SYSTEM    0x2
 #define XAM_ORD_XNOTIFYQUEUEUI  656
 
 typedef VOID (*PFN_XNOTIFYQUEUEUI)(DWORD type, DWORD userIndex, ULONGLONG areas,
@@ -70,36 +79,17 @@ static const char* LIBRARY_DIRS[] = { "HmHdd:\\mindex", "HmHdd:\\Content\\mindex
 // Helpers
 // ---------------------------------------------------------------------------
 
-static DWORD WINAPI NotifyThread(LPVOID text)
-{
-    pXNotifyQueueUI(14, 0, 2, (LPCWSTR)text, NULL);  // 14 = custom text, 2 = high priority
-    free(text);
-    return 0;
-}
-
-// XNotifyQueueUI is meant to be called from a title thread, and ours is a
-// system thread, so each notification gets a short-lived title thread.
+// Called straight from our system thread, as other working plugins do.
 static void Notify(LPCWSTR fmt, ...)
 {
     if (!pXNotifyQueueUI)
         return;
-    WCHAR* text = (WCHAR*)malloc(160 * sizeof(WCHAR));
-    if (!text)
-        return;
+    WCHAR text[160];
     va_list args;
     va_start(args, fmt);
     _vsnwprintf_s(text, 160, _TRUNCATE, fmt, args);
     va_end(args);
-
-    HANDLE thread = NULL;
-    DWORD threadId;
-    DWORD status = ExCreateThread(&thread, 0, &threadId, (VOID*)XapiThreadStartup,
-                                  NotifyThread, text, 0);
-    if ((LONG)status < 0 || !thread) {
-        free(text);
-        return;
-    }
-    CloseHandle(thread);
+    pXNotifyQueueUI(14, 0xFF, 2, text, NULL);  // custom text, any user, high priority
 }
 
 static void Mount(const char* link, const char* device)
@@ -286,6 +276,24 @@ static BOOL AddBatch(Import& import, SongFile* songs, DWORD count)
     return TRUE;
 }
 
+static BOOL FolderHasFiles(const char* folder)
+{
+    char pattern[MAX_PATH];
+    sprintf_s(pattern, "%s\\*", folder);
+    WIN32_FIND_DATA fd;
+    HANDLE find = FindFirstFile(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE)
+        return FALSE;
+    BOOL found = FALSE;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            found = TRUE;
+    } while (!found && FindNextFile(find, &fd));
+    FindClose(find);
+    return found;
+}
+
+// Loads the library (or starts a new one).  Shows its own message on failure.
 static BOOL OpenLibrary(Import& import, BOOL* existed)
 {
     // Use whichever library folder exists, or make the standard one.
@@ -300,6 +308,9 @@ static BOOL OpenLibrary(Import& import, BOOL* existed)
     char path[MAX_PATH];
     sprintf_s(path, "%s\\mindex.xmi", import.libraryDir);
     *existed = Exists(path);
+    char media[MAX_PATH];
+    sprintf_s(media, "%s\\media\\0000", import.libraryDir);
+    Result result;
     if (*existed) {
         DWORD size = 0;
         unsigned char* data = ReadWholeFile(path, 0, &size);
@@ -307,20 +318,30 @@ static BOOL OpenLibrary(Import& import, BOOL* existed)
             Notify(L"HddMusic: can't read the music library. Restart and try again.");
             return FALSE;
         }
-        import.error = import.library.Load(data, size);
+        result = import.library.Load(data, size);
         free(data);
-    } else {
-        import.error = import.library.CreateNew();
-    }
-    if (import.error != RESULT_OK)
+    } else if (FolderHasFiles(media)) {
+        // Songs but no index: starting a new library would overwrite them.
+        Notify(L"HddMusic: songs found without mindex.xmi. Restore mindex.xmi.bak first. "
+               L"Nothing was changed.");
         return FALSE;
+    } else {
+        result = import.library.CreateNew();
+    }
+    if (result != RESULT_OK) {
+        Notify(L"HddMusic: %S. Nothing was changed.", ResultText(result));
+        return FALSE;
+    }
 
     CreateDirectory(import.libraryDir, NULL);
     sprintf_s(path, "%s\\media", import.libraryDir);
     CreateDirectory(path, NULL);
-    sprintf_s(path, "%s\\media\\0000", import.libraryDir);
-    CreateDirectory(path, NULL);
-    return Exists(path);
+    CreateDirectory(media, NULL);
+    if (!Exists(media)) {
+        Notify(L"HddMusic: can't create the music folder on the hard drive.");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void RipFromUsb()
@@ -354,13 +375,8 @@ static void RipFromUsb()
         Notify(L"HddMusic: out of memory");
         goto done;
     }
-    if (!OpenLibrary(*import, &existed)) {
-        if (import->error != RESULT_OK)
-            Notify(L"HddMusic: %S. Nothing was changed.", ResultText(import->error));
-        else
-            Notify(L"HddMusic: can't create the music folder on the hard drive.");
+    if (!OpenLibrary(*import, &existed))
         goto done;
-    }
 
     Notify(L"HddMusic: ripping songs from USB to the hard drive...");
     {
@@ -374,6 +390,10 @@ static void RipFromUsb()
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                     continue;
+                if (strlen(fd.cFileName) > 200) {  // ours are 13 characters
+                    import->failed++;
+                    continue;
+                }
                 sprintf_s(path, "%s\\%s", import->usbDir, fd.cFileName);
                 DWORD size;
                 unsigned char* header = ReadWholeFile(path, FMIM_HEADER_SIZE, &size);
@@ -408,22 +428,35 @@ static void RipFromUsb()
     }
 
     {
-        char path[MAX_PATH], backup[MAX_PATH];
+        // Write the new index in full first, back up the old one, then swap.
+        char path[MAX_PATH], backup[MAX_PATH], fresh[MAX_PATH];
         sprintf_s(path, "%s\\mindex.xmi", import->libraryDir);
         sprintf_s(backup, "%s\\mindex.xmi.bak", import->libraryDir);
+        sprintf_s(fresh, "%s\\mindex.xmi.new", import->libraryDir);
+        if (!WriteWholeFile(fresh, import->library.Data(), import->library.Size())) {
+            DeleteCopiedSongs(*import);
+            Notify(L"HddMusic: can't write to the hard drive (is it full?). Nothing was changed.");
+            goto done;
+        }
         if (existed && !CopyOneFile(path, backup, import->copyBuffer)) {
+            DeleteFile(fresh);
             DeleteCopiedSongs(*import);
             Notify(L"HddMusic: can't back up the music library. Nothing was changed.");
             goto done;
         }
-        if (!WriteWholeFile(path, import->library.Data(), import->library.Size())) {
-            if (existed)
-                CopyOneFile(backup, path, import->copyBuffer);
+        if (!CopyOneFile(fresh, path, import->copyBuffer)) {
+            // A failed copy deletes the half-written mindex.xmi; put the old one back.
+            BOOL restored = !existed || CopyOneFile(backup, path, import->copyBuffer);
+            DeleteFile(fresh);
             DeleteCopiedSongs(*import);
-            Notify(L"HddMusic: can't save the music library (is the Music Player open?). "
-                   L"Nothing was changed.");
+            if (restored)
+                Notify(L"HddMusic: can't save the music library (is the Music Player open?). "
+                       L"Nothing was changed.");
+            else
+                Notify(L"HddMusic: SAVING FAILED. Copy mindex\\mindex.xmi.bak to mindex.xmi by FTP.");
             goto done;
         }
+        DeleteFile(fresh);
     }
     if (import->failed)
         Notify(L"HddMusic: added %u songs, %u FAILED. Restart the console to see them.",
@@ -473,14 +506,18 @@ static DWORD WINAPI MainThread(LPVOID)
 BOOL APIENTRY DllMain(HANDLE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        HANDLE thread;
+        // A system thread survives title switches. Same flags as the hiddriver360 plugin.
+        HANDLE thread = NULL;
         DWORD threadId;
         ExCreateThread(&thread, 0, &threadId, (VOID*)XapiThreadStartup,
                        (LPTHREAD_START_ROUTINE)MainThread, NULL,
-                       EX_CREATE_FLAG_SYSTEM | CREATE_SUSPENDED);
-        XSetThreadProcessor(thread, 4);
-        ResumeThread(thread);
-        CloseHandle(thread);
+                       EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424);
+        if (thread) {
+            XSetThreadProcessor(thread, 4);
+            SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
+            ResumeThread(thread);
+            CloseHandle(thread);
+        }
     } else if (reason == DLL_PROCESS_DETACH) {
         g_running = FALSE;
     }

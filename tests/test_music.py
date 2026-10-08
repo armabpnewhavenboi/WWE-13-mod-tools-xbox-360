@@ -110,6 +110,19 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(added, len(reloaded.records) - 1)
         self.assertEqual(reloaded.check(), [])
 
+    def test_same_title_different_track_numbers(self):
+        lib = mindex.Library()
+        skits = [song("Skit", "Album", "Ann", "Pop", n, 5000) for n in (3, 7, 11)]
+        self.assertEqual([lib.add_song(s) is not None for s in skits], [True, True, True])
+        self.assertIsNone(lib.add_song(song("Skit", "Album", "Ann", "Pop", 7, 5000)))
+        long_a = song("x" * 39 + " part one", "Album", "Ann", "Pop", 1, 5000)
+        long_b = song("x" * 39 + " part two", "Album", "Ann", "Pop", 2, 5000)
+        self.assertIsNotNone(lib.add_song(long_a))
+        self.assertIsNotNone(lib.add_song(long_b))
+        high = lib.add_song(song("Bonus", "Album", "Ann", "Pop", 70, 5000))
+        self.assertEqual(lib.track_number(high), 63)  # six bits: capped, not wrapped
+        self.assertEqual(lib.check(), [])
+
     def test_plan_matches_add(self):
         lib = mindex.Library()
         for info in random_songs(random.Random(7), 120):

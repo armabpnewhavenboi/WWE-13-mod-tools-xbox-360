@@ -253,9 +253,10 @@ stfschk (emoose).
 ## Extra: your own music on the Xbox hard drive
 
 [`homebrew/HddMusic`](homebrew/HddMusic/README.md) puts your MP3s in the
-console's hard-drive music library, the same place ripped CDs go. They then
-play from **Music Player > Hard Drive** and, through the Guide, during any
-game that allows custom soundtracks, with no USB stick needed.
+console's hard-drive music library, the same place ripped CDs go, so they can
+play from **Music Player > Hard Drive** and, through the Guide, during games
+that allow custom soundtracks, with no USB stick needed. It needs an RGH/JTAG
+console with DashLaunch, and hasn't been tested on a console yet.
 
 - **`x360music`** (in this repository; `HddMusic-Converter.exe` on Windows)
   converts MP3s to the WMA format the console's CD ripper uses and puts them
