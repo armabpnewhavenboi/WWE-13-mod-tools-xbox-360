@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Your personal settings and console keys - never commit these.
+x360resign.ini
+*.bin
+KV*
+kv*
+
+# Working folders
+resigned_saves/
+out/

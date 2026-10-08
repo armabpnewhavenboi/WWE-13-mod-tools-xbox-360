@@ -1,0 +1,61 @@
+name: Test and build Windows exe
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # only used to attach the exe to a GitHub release when a v* tag is pushed
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Build window version
+        run: pyinstaller --noconfirm --onefile --windowed --name WWE13-Resigner launcher.py
+      - name: Build command-line version
+        run: pyinstaller --noconfirm --onefile --console --name x360resign launcher.py
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          ./dist/x360resign.exe --version
+          ./dist/x360resign.exe --help
+      - name: Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item dist/WWE13-Resigner.exe, dist/x360resign.exe, README.md -Destination package
+          Compress-Archive -Path package/* -DestinationPath WWE13-Resigner-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WWE13-Resigner-windows
+          path: package/
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" WWE13-Resigner-windows.zip --title "${{ github.ref_name }}" --notes "Windows build of x360resign. See README.md for instructions."
